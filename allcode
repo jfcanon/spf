@@ -1,0 +1,2807 @@
+# Spotify Clone – full source
+
+## backend/server.py
+```
+import asyncio
+from contextlib import suppress
+from fastapi import FastAPI, APIRouter, Query, HTTPException
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ASCENDING, DESCENDING, IndexModel
+from bson import ObjectId
+import os
+import logging
+import httpx
+from pathlib import Path
+from pydantic import BaseModel, Field, BeforeValidator, ConfigDict
+from typing import List, Optional, Annotated
+from datetime import datetime, timezone
+
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+DEEZER = "https://api.deezer.com"
+
+INDEXES: dict[str, list[IndexModel]] = {
+    "liked": [
+        IndexModel([("track_id", ASCENDING)], name="track_id", unique=True),
+        IndexModel([("created_at", DESCENDING)], name="created_desc"),
+    ],
+    "recent": [
+        IndexModel([("track_id", ASCENDING)], name="track_id", unique=True),
+        IndexModel([("played_at", DESCENDING)], name="played_desc"),
+    ],
+    "playlists": [IndexModel([("updated_at", DESCENDING)], name="updated_desc")],
+}
+
+
+async def ensure_indexes() -> None:
+    for collection, models in INDEXES.items():
+        for model in models:
+            try:
+                await db[collection].create_indexes([model])
+            except Exception as exc:
+                logging.getLogger(__name__).error("ensure_indexes(%s.%s): %s", collection, model.document["name"], exc)
+
+
+app = FastAPI()
+
+
+@app.get("/health", include_in_schema=False)
+@app.head("/health", include_in_schema=False)
+async def health():
+    return {"status": "ok"}
+
+
+api_router = APIRouter(prefix="/api")
+
+# ---------- Models ----------
+PyObjectId = Annotated[str, BeforeValidator(lambda v: str(v) if isinstance(v, ObjectId) else v)]
+
+
+class BaseDocument(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    id: Optional[PyObjectId] = Field(default=None, alias="_id")
+
+    @classmethod
+    def from_mongo(cls, doc: dict):
+        return cls.model_validate(doc)
+
+    def to_mongo(self) -> dict:
+        data = self.model_dump(by_alias=True, exclude={"id"})
+        if self.id:
+            data["_id"] = ObjectId(self.id)
+        return data
+
+
+class Track(BaseModel):
+    id: str
+    title: str
+    artist: str
+    artist_id: str = ""
+    album: str = ""
+    album_id: str = ""
+    cover: str = ""
+    cover_small: str = ""
+    preview: str = ""
+    duration: int = 30
+
+
+class Playlist(BaseDocument):
+    name: str
+    description: str = ""
+    tracks: List[Track] = []
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class PlaylistCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    description: str = ""
+
+
+# ---------- Deezer helpers ----------
+http = httpx.AsyncClient(timeout=15)
+
+
+async def dz(path: str, params: Optional[dict] = None) -> dict:
+    r = await http.get(f"{DEEZER}{path}", params=params)
+    data = r.json()
+    if isinstance(data, dict) and data.get("error"):
+        raise HTTPException(404, data["error"].get("message", "Not found"))
+    return data
+
+
+def map_track(t: dict, album: Optional[dict] = None) -> Optional[dict]:
+    if not t.get("preview"):
+        return None
+    alb = t.get("album") or album or {}
+    art = t.get("artist") or {}
+    return Track(
+        id=str(t["id"]), title=t.get("title_short") or t.get("title", ""),
+        artist=art.get("name", ""), artist_id=str(art.get("id", "")),
+        album=alb.get("title", ""), album_id=str(alb.get("id", "")),
+        cover=alb.get("cover_xl") or alb.get("cover_big") or "",
+        cover_small=alb.get("cover_medium") or "",
+        preview=t["preview"], duration=t.get("duration", 30),
+    ).model_dump()
+
+
+def map_tracks(items: list, album: Optional[dict] = None) -> list:
+    return [m for m in (map_track(t, album) for t in items) if m]
+
+
+def map_album(a: dict) -> dict:
+    return {"id": str(a["id"]), "title": a.get("title", ""), "subtitle": (a.get("artist") or {}).get("name", "Album"),
+            "cover": a.get("cover_xl") or a.get("cover_big", ""), "type": "album"}
+
+
+def map_playlist(p: dict) -> dict:
+    return {"id": str(p["id"]), "title": p.get("title", ""), "subtitle": f"{p.get('nb_tracks', 0)} songs",
+            "cover": p.get("picture_xl") or p.get("picture_big", ""), "type": "playlist"}
+
+
+def map_artist(a: dict) -> dict:
+    return {"id": str(a["id"]), "title": a.get("name", ""), "subtitle": "Artist",
+            "cover": a.get("picture_xl") or a.get("picture_big", ""), "type": "artist"}
+
+
+# ---------- Catalog ----------
+@api_router.get("/")
+async def root():
+    return {"message": "Spotify clone API"}
+
+
+@api_router.get("/home")
+async def home():
+    chart, recent = await asyncio.gather(dz("/chart/0", {"limit": 20}), list_recent(8))
+    return {
+        "recent": recent,
+        "top_tracks": map_tracks(chart.get("tracks", {}).get("data", [])),
+        "playlists": [map_playlist(p) for p in chart.get("playlists", {}).get("data", [])],
+        "albums": [map_album(a) for a in chart.get("albums", {}).get("data", [])],
+        "artists": [map_artist(a) for a in chart.get("artists", {}).get("data", [])],
+    }
+
+
+@api_router.get("/genres")
+async def genres():
+    data = await dz("/genre")
+    return [{"id": str(g["id"]), "name": g["name"], "picture": g.get("picture_xl", "")}
+            for g in data.get("data", []) if g["id"] != 0]
+
+
+@api_router.get("/search")
+async def search(q: str = Query(..., min_length=1)):
+    tracks, albums, artists = await asyncio.gather(
+        dz("/search", {"q": q, "limit": 20}), dz("/search/album", {"q": q, "limit": 10}),
+        dz("/search/artist", {"q": q, "limit": 10}))
+    return {
+        "tracks": map_tracks(tracks.get("data", [])),
+        "albums": [map_album(a) for a in albums.get("data", [])],
+        "artists": [map_artist(a) for a in artists.get("data", [])],
+    }
+
+
+@api_router.get("/tracks/{track_id}")
+async def get_track(track_id: str):
+    t = map_track(await dz(f"/track/{track_id}"))
+    if not t:
+        raise HTTPException(404, "No preview available")
+    return t
+
+
+@api_router.get("/albums/{album_id}")
+async def get_album(album_id: str):
+    a = await dz(f"/album/{album_id}")
+    return {"id": album_id, "title": a["title"], "subtitle": a.get("artist", {}).get("name", ""),
+            "cover": a.get("cover_xl", ""), "type": "album",
+            "tracks": map_tracks(a.get("tracks", {}).get("data", []), a)}
+
+
+@api_router.get("/deezer-playlists/{playlist_id}")
+async def get_dz_playlist(playlist_id: str):
+    p = await dz(f"/playlist/{playlist_id}")
+    return {"id": playlist_id, "title": p["title"], "subtitle": p.get("description") or f"{p.get('nb_tracks', 0)} songs",
+            "cover": p.get("picture_xl", ""), "type": "playlist",
+            "tracks": map_tracks(p.get("tracks", {}).get("data", [])[:50])}
+
+
+@api_router.get("/artists/{artist_id}")
+async def get_artist(artist_id: str):
+    a, top = await asyncio.gather(dz(f"/artist/{artist_id}"), dz(f"/artist/{artist_id}/top", {"limit": 20}))
+    return {"id": artist_id, "title": a["name"], "subtitle": f"{a.get('nb_fan', 0):,} fans",
+            "cover": a.get("picture_xl", ""), "type": "artist", "tracks": map_tracks(top.get("data", []))}
+
+
+@api_router.get("/genres/{genre_id}")
+async def get_genre(genre_id: str):
+    g, artists = await asyncio.gather(dz(f"/genre/{genre_id}"), dz(f"/genre/{genre_id}/artists"))
+    first = artists.get("data", [])[:5]
+    tops = await asyncio.gather(*[dz(f"/artist/{a['id']}/top", {"limit": 5}) for a in first])
+    tracks = [t for top in tops for t in map_tracks(top.get("data", []))]
+    return {"id": genre_id, "title": g["name"], "subtitle": "Top tracks in this genre",
+            "cover": g.get("picture_xl", ""), "type": "genre", "tracks": tracks}
+
+
+# ---------- Liked ----------
+@api_router.get("/liked", response_model=List[Track])
+async def list_liked():
+    docs = await db.liked.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return [Track(**d["track"]) for d in docs]
+
+
+@api_router.get("/liked/ids", response_model=List[str])
+async def liked_ids():
+    docs = await db.liked.find({}, {"_id": 0, "track_id": 1}).to_list(5000)
+    return [d["track_id"] for d in docs]
+
+
+@api_router.post("/liked", response_model=Track)
+async def like(track: Track):
+    await db.liked.update_one({"track_id": track.id}, {"$set": {
+        "track_id": track.id, "track": track.model_dump(),
+        "created_at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
+    return track
+
+
+@api_router.delete("/liked/{track_id}")
+async def unlike(track_id: str):
+    await db.liked.delete_one({"track_id": track_id})
+    return {"ok": True}
+
+
+# ---------- Recently played ----------
+@api_router.get("/recent", response_model=List[Track])
+async def get_recent(limit: int = Query(20, ge=1, le=50)):
+    return await list_recent(limit)
+
+
+async def list_recent(limit: int) -> list:
+    docs = await db.recent.find({}, {"_id": 0}).sort("played_at", -1).limit(limit).to_list(limit)
+    return [Track(**d["track"]).model_dump() for d in docs]
+
+
+@api_router.post("/recent")
+async def add_recent(track: Track):
+    await db.recent.update_one({"track_id": track.id}, {"$set": {
+        "track_id": track.id, "track": track.model_dump(),
+        "played_at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
+    return {"ok": True}
+
+
+# ---------- User playlists ----------
+def oid(pid: str) -> ObjectId:
+    if not ObjectId.is_valid(pid):
+        raise HTTPException(404, "Playlist not found")
+    return ObjectId(pid)
+
+
+async def get_pl(pid: str) -> Playlist:
+    doc = await db.playlists.find_one({"_id": oid(pid)})
+    if not doc:
+        raise HTTPException(404, "Playlist not found")
+    return Playlist.from_mongo(doc)
+
+
+@api_router.get("/playlists", response_model=List[Playlist])
+async def list_playlists():
+    docs = await db.playlists.find().sort("updated_at", -1).to_list(500)
+    return [Playlist.from_mongo(d) for d in docs]
+
+
+@api_router.post("/playlists", response_model=Playlist)
+async def create_playlist(body: PlaylistCreate):
+    pl = Playlist(name=body.name.strip(), description=body.description)
+    res = await db.playlists.insert_one(pl.to_mongo())
+    pl.id = str(res.inserted_id)
+    return pl
+
+
+@api_router.get("/playlists/{pid}", response_model=Playlist)
+async def get_playlist(pid: str):
+    return await get_pl(pid)
+
+
+@api_router.delete("/playlists/{pid}")
+async def delete_playlist(pid: str):
+    await db.playlists.delete_one({"_id": oid(pid)})
+    return {"ok": True}
+
+
+@api_router.post("/playlists/{pid}/tracks", response_model=Playlist)
+async def add_to_playlist(pid: str, track: Track):
+    pl = await get_pl(pid)
+    if not any(t.id == track.id for t in pl.tracks):
+        pl.tracks.append(track)
+    pl.updated_at = datetime.now(timezone.utc).isoformat()
+    await db.playlists.replace_one({"_id": oid(pid)}, pl.to_mongo())
+    return pl
+
+
+@api_router.delete("/playlists/{pid}/tracks/{track_id}", response_model=Playlist)
+async def remove_from_playlist(pid: str, track_id: str):
+    pl = await get_pl(pid)
+    pl.tracks = [t for t in pl.tracks if t.id != track_id]
+    pl.updated_at = datetime.now(timezone.utc).isoformat()
+    await db.playlists.replace_one({"_id": oid(pid)}, pl.to_mongo())
+    return pl
+
+
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+@app.on_event("startup")
+async def start_index_build():
+    app.state.index_task = asyncio.create_task(ensure_indexes())
+
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    app.state.index_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await app.state.index_task
+    await http.aclose()
+    client.close()
+```
+
+## backend/requirements.txt
+```
+fastapi==0.110.1
+uvicorn==0.25.0
+boto3>=1.34.129
+requests-oauthlib>=2.0.0
+cryptography>=42.0.8
+python-dotenv>=1.0.1
+pymongo==4.18.2
+pydantic>=2.6.4
+email-validator>=2.2.0
+pyjwt>=2.10.1
+bcrypt==4.1.3
+passlib>=1.7.4
+tzdata>=2024.2
+motor==3.7.1
+pytest>=8.0.0
+pytest-xdist>=3.6.0
+black>=24.1.1
+isort>=5.13.2
+flake8>=7.0.0
+mypy>=1.8.0
+python-jose>=3.3.0
+requests>=2.31.0
+pandas>=2.2.0
+numpy>=1.26.0
+python-multipart>=0.0.9
+jq>=1.6.0
+typer>=0.9.0
+emergentintegrations==0.2.2
+```
+
+## frontend/package.json
+```
+{
+  "name": "frontend",
+  "main": "expo-router/entry",
+  "version": "1.0.0",
+  "scripts": {
+    "preinstall": "./scripts/cmd-guard.js --preinstall",
+    "start": "expo start",
+    "reset-project": "node ./scripts/reset-project.js",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "lint": "expo lint"
+  },
+  "dependencies": {
+    "@expo/metro-runtime": "58.0.15",
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "@react-native-vector-icons/ionicons": "14.0.0",
+    "@tanstack/react-query": "5.102.8",
+    "date-fns": "4.1.0",
+    "dayjs": "1.11.13",
+    "expo": "58.0.17",
+    "expo-audio": "~58.0.12",
+    "expo-blur": "58.0.5",
+    "expo-constants": "58.0.13",
+    "expo-font": "58.0.9",
+    "expo-haptics": "58.0.7",
+    "expo-image": "58.0.16",
+    "expo-linear-gradient": "58.0.3",
+    "expo-linking": "58.0.14",
+    "expo-router": "58.0.25",
+    "expo-secure-store": "58.0.2",
+    "expo-splash-screen": "58.0.11",
+    "expo-status-bar": "58.0.4",
+    "expo-symbols": "58.0.4",
+    "expo-system-ui": "58.0.6",
+    "expo-web-browser": "58.0.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-native": "0.88.0",
+    "react-native-dotenv": "3.4.11",
+    "react-native-gesture-handler": "3.3.0",
+    "react-native-keyboard-controller": "1.22.7",
+    "react-native-reanimated": "4.7.1",
+    "react-native-safe-area-context": "5.10.1",
+    "react-native-screens": "4.30.0",
+    "react-native-web": "0.21.4",
+    "react-native-webview": "14.0.1",
+    "react-native-worklets": "0.13.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "eslint": "9.25.0",
+    "eslint-config-expo": "58.0.4",
+    "expo-doctor": "1.19.8",
+    "typescript": "6.0.3"
+  },
+  "resolutions": {
+    "@eslint/plugin-kit": "0.3.4",
+    "postcss": "8.5.28",
+    "uuid": "11.1.1",
+    "undici": "6.29.0",
+    "tar": "7.5.22",
+    "**/@eslint/eslintrc/js-yaml": "4.3.2",
+    "**/@expo/xcpretty/js-yaml": "4.3.2",
+    "**/@istanbuljs/load-nyc-config/js-yaml": "3.15.2",
+    "shell-quote": "1.11.0"
+  },
+  "private": true,
+  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+}
+```
+
+## frontend/app.json
+```
+{
+  "expo": {
+    "name": "Spotify Clone",
+    "slug": "frontend",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "frontend",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.emergent.musicstreamclone.cssx5j"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "backgroundColor": "#000000"
+      },
+      "package": "com.emergent.musicstreamclone.cssx5j"
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/splash-image.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#000000"
+        }
+      ],
+      "expo-font",
+      "expo-image",
+      "expo-secure-store",
+      "expo-web-browser",
+      "expo-status-bar",
+      "expo-audio",
+      "@react-native-vector-icons/ionicons"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}```
+
+## frontend/app/(tabs)/_layout.tsx
+```
+import { Ionicons } from "@react-native-vector-icons/ionicons";
+import { Tabs } from "expo-router";
+import { NativeTabs } from "expo-router/unstable-native-tabs";
+import { Platform } from "react-native";
+
+import { usesNativeTabs } from "@/src/navigation";
+import { useTheme } from "@/src/theme";
+
+export default function TabsLayout() {
+  const { colors } = useTheme();
+
+  if (usesNativeTabs) {
+    return (
+      <NativeTabs tintColor={colors.onSurface}>
+        <NativeTabs.Trigger name="index">
+          <NativeTabs.Trigger.Icon sf="house.fill" />
+          <NativeTabs.Trigger.Label>Home</NativeTabs.Trigger.Label>
+        </NativeTabs.Trigger>
+        <NativeTabs.Trigger name="search">
+          <NativeTabs.Trigger.Icon sf="magnifyingglass" />
+          <NativeTabs.Trigger.Label>Search</NativeTabs.Trigger.Label>
+        </NativeTabs.Trigger>
+        <NativeTabs.Trigger name="library">
+          <NativeTabs.Trigger.Icon sf="books.vertical.fill" />
+          <NativeTabs.Trigger.Label>Library</NativeTabs.Trigger.Label>
+        </NativeTabs.Trigger>
+      </NativeTabs>
+    );
+  }
+
+  return (
+    <Tabs
+      screenOptions={{
+        headerShown: false,
+        tabBarActiveTintColor: colors.onSurface,
+        tabBarInactiveTintColor: colors.muted,
+        tabBarStyle: {
+          backgroundColor: colors.surface,
+          borderTopColor: colors.border,
+          ...(Platform.OS === "web" ? { height: 64 } : {}),
+        },
+        tabBarItemStyle: { alignSelf: "center" },
+        tabBarLabelStyle: { fontSize: 11, fontWeight: "500" },
+      }}
+    >
+      <Tabs.Screen
+        name="index"
+        options={{
+          title: "Home",
+          tabBarButtonTestID: "tab-home",
+          tabBarIcon: ({ color, focused }) => <Ionicons name={focused ? "home" : "home-outline"} size={24} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="search"
+        options={{
+          title: "Search",
+          tabBarButtonTestID: "tab-search",
+          tabBarIcon: ({ color, focused }) => <Ionicons name={focused ? "search" : "search-outline"} size={24} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="library"
+        options={{
+          title: "Library",
+          tabBarButtonTestID: "tab-library",
+          tabBarIcon: ({ color, focused }) => <Ionicons name={focused ? "library" : "library-outline"} size={24} color={color} />,
+        }}
+      />
+    </Tabs>
+  );
+}
+```
+
+## frontend/app/(tabs)/index.tsx
+```
+import { useQuery } from "@tanstack/react-query";
+import { Image } from "expo-image";
+import { useMemo } from "react";
+import { ActivityIndicator, Pressable, RefreshControl, ScrollView, Text, View } from "react-native";
+import Animated, { FadeInDown } from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import { api, HomeData, Track } from "@/src/api";
+import { Rail } from "@/src/components/media-card";
+import { MiniPlayer } from "@/src/components/mini-player";
+import { usesNativeTabs } from "@/src/navigation";
+import { usePlayer } from "@/src/player";
+import { makeStyles, useTheme } from "@/src/theme";
+
+const greeting = () => {
+  const h = new Date().getHours();
+  return h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
+};
+
+export default function Home() {
+  const styles = useStyles();
+  const { colors } = useTheme();
+  const insets = useSafeAreaInsets();
+  const bottomChrome = usesNativeTabs ? insets.bottom : 0;
+  const { playQueue, current } = usePlayer();
+  const { data, isLoading, isError, refetch, isRefetching } = useQuery({
+    queryKey: ["home"],
+    queryFn: () => api<HomeData>("/home"),
+  });
+
+  const trackCards = useMemo(
+    () => (data?.top_tracks ?? []).map((t: Track) => ({ id: t.id, title: t.title, subtitle: t.artist, cover: t.cover, type: "album" as const })),
+    [data],
+  );
+
+  return (
+    <View style={styles.screen} testID="home-screen">
+      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
+        <Text style={styles.greeting} testID="home-greeting">{greeting()}</Text>
+      </View>
+      {isLoading ? (
+        <ActivityIndicator style={styles.center} color={colors.brandPrimary} size="large" testID="home-loading" />
+      ) : isError ? (
+        <View style={styles.center}>
+          <Text style={styles.muted}>Could not load your feed</Text>
+          <Pressable testID="home-retry" onPress={() => refetch()} style={styles.retry}>
+            <Text style={styles.retryText}>Retry</Text>
+          </Pressable>
+        </View>
+      ) : (
+        <ScrollView
+          contentContainerStyle={{ paddingBottom: bottomChrome + (current ? 88 : 24) }}
+          refreshControl={<RefreshControl refreshing={isRefetching} onRefresh={() => { refetch(); }} tintColor={colors.brandPrimary} />}
+        >
+          {!!data?.recent.length && (
+            <View style={styles.grid} testID="home-recent-grid">
+              {data.recent.slice(0, 6).map((t, i) => (
+                <Animated.View key={t.id} entering={FadeInDown.delay(i * 40)} style={styles.tileWrap}>
+                  <Pressable
+                    testID={`recent-tile-${t.id}`}
+                    onPress={() => playQueue(data.recent, i)}
+                    style={({ pressed }) => [styles.tile, pressed && { opacity: 0.7 }]}
+                  >
+                    <Image source={{ uri: t.cover_small }} style={styles.tileImg} />
+                    <Text numberOfLines={2} style={styles.tileText}>{t.title}</Text>
+                  </Pressable>
+                </Animated.View>
+              ))}
+            </View>
+          )}
+          <Rail title="Trending now" testID="rail-top-tracks" items={trackCards} onItemPress={(i) => playQueue(data!.top_tracks, i)} />
+          <Rail title="Featured playlists" testID="rail-playlists" items={data?.playlists ?? []} />
+          <Rail title="Popular albums" testID="rail-albums" items={data?.albums ?? []} />
+          <Rail title="Popular artists" testID="rail-artists" items={data?.artists ?? []} />
+        </ScrollView>
+      )}
+      <MiniPlayer bottom={bottomChrome + 8} />
+    </View>
+  );
+}
+
+const useStyles = makeStyles((c) => ({
+  screen: { flex: 1, backgroundColor: c.surface },
+  header: { paddingHorizontal: 16, paddingBottom: 12, backgroundColor: c.surface },
+  greeting: { color: c.onSurface, fontSize: 26, fontWeight: "500" },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 16 },
+  muted: { color: c.muted, fontSize: 14 },
+  retry: { backgroundColor: c.onSurface, borderRadius: 999, paddingHorizontal: 24, height: 44, justifyContent: "center" },
+  retryText: { color: c.surface, fontSize: 14, fontWeight: "500" },
+  grid: { flexDirection: "row", flexWrap: "wrap", paddingHorizontal: 12, paddingTop: 4 },
+  tileWrap: { width: "50%", padding: 4 },
+  tile: { flexDirection: "row", alignItems: "center", backgroundColor: c.surfaceTertiary, borderRadius: 6, overflow: "hidden", gap: 8, height: 56 },
+  tileImg: { width: 56, height: 56 },
+  tileText: { flex: 1, color: c.onSurface, fontSize: 13, fontWeight: "500", paddingRight: 8 },
+}));
+```
+
+## frontend/app/(tabs)/library.tsx
+```
+import { Ionicons } from "@react-native-vector-icons/ionicons";
+import { Image } from "expo-image";
+import { LinearGradient } from "expo-linear-gradient";
+import { router } from "expo-router";
+import { ReactNode, useState } from "react";
+import { ActivityIndicator, FlatList, Pressable, RefreshControl, Text, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import { useLikedIds, usePlaylists } from "@/src/api";
+import { CreatePlaylistModal } from "@/src/components/create-playlist-modal";
+import { MiniPlayer } from "@/src/components/mini-player";
+import { usesNativeTabs } from "@/src/navigation";
+import { usePlayer } from "@/src/player";
+import { makeStyles, useTheme } from "@/src/theme";
+
+const PLAYLIST_COVER =
+  "https://images.unsplash.com/photo-1459749411175-04bf5292ceea?crop=entropy&cs=srgb&fm=jpg&q=60&w=400";
+
+export default function Library() {
+  const styles = useStyles();
+  const { colors } = useTheme();
+  const insets = useSafeAreaInsets();
+  const bottomChrome = usesNativeTabs ? insets.bottom : 0;
+  const { current } = usePlayer();
+  const likedIds = useLikedIds();
+  const { data = [], isLoading, refetch, isRefetching } = usePlaylists();
+  const [creating, setCreating] = useState(false);
+
+  return (
+    <View style={styles.screen} testID="library-screen">
+      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
+        <Text style={styles.title}>Your Library</Text>
+        <Pressable testID="library-create-playlist" onPress={() => setCreating(true)} style={styles.addBtn} hitSlop={6}>
+          <Ionicons name="add" size={28} color={colors.onSurface} />
+        </Pressable>
+      </View>
+      <FlatList
+        data={data}
+        keyExtractor={(p) => p.id}
+        refreshControl={<RefreshControl refreshing={isRefetching} onRefresh={() => { refetch(); }} tintColor={colors.brandPrimary} />}
+        contentContainerStyle={{ paddingBottom: bottomChrome + (current ? 88 : 24) }}
+        ListHeaderComponent={
+          <View>
+            <Row
+              id="library-liked-songs"
+              title="Liked Songs"
+              subtitle={`Playlist · ${likedIds.size} songs`}
+              onPress={() => router.push("/collection/liked/all")}
+              cover={
+                <LinearGradient colors={["#450AF5", "#C4EFD9"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.cover}>
+                  <Ionicons name="heart" size={26} color="#FFFFFF" />
+                </LinearGradient>
+              }
+            />
+            <Row
+              id="library-recently-played"
+              title="Recently played"
+              subtitle="Your listening history"
+              onPress={() => router.push("/collection/recent/all")}
+              cover={
+                <View style={[styles.cover, { backgroundColor: colors.brandTertiary }]}>
+                  <Ionicons name="time" size={26} color={colors.onBrandTertiary} />
+                </View>
+              }
+            />
+            {isLoading && <ActivityIndicator color={colors.brandPrimary} style={{ marginTop: 24 }} />}
+          </View>
+        }
+        ListEmptyComponent={
+          isLoading ? undefined : (
+            <View style={styles.empty} testID="library-empty">
+              <Text style={styles.emptyTitle}>Create your first playlist</Text>
+              <Text style={styles.rowSub}>It&apos;s easy, we&apos;ll help you.</Text>
+              <Pressable testID="library-empty-create" onPress={() => setCreating(true)} style={styles.emptyBtn}>
+                <Text style={styles.emptyBtnText}>Create playlist</Text>
+              </Pressable>
+            </View>
+          )
+        }
+        renderItem={({ item }) => (
+          <Row
+            id={`library-playlist-${item.id}`}
+            title={item.name}
+            subtitle={`Playlist · ${item.tracks.length} songs`}
+            onPress={() => router.push(`/collection/mine/${item.id}`)}
+            cover={<Image source={{ uri: item.tracks[0]?.cover_small || PLAYLIST_COVER }} style={styles.cover} />}
+          />
+        )}
+      />
+      <MiniPlayer bottom={bottomChrome + 8} />
+      <CreatePlaylistModal
+        visible={creating}
+        onClose={() => setCreating(false)}
+        onCreated={(p) => router.push(`/collection/mine/${p.id}`)}
+      />
+    </View>
+  );
+}
+
+function Row({ id, cover, title, subtitle, onPress }: { id: string; cover: ReactNode; title: string; subtitle: string; onPress: () => void }) {
+  const styles = useStyles();
+  return (
+    <Pressable testID={id} onPress={onPress} style={({ pressed }) => [styles.row, pressed && styles.pressed]}>
+      {cover}
+      <View style={{ flex: 1 }}>
+        <Text numberOfLines={1} style={styles.rowTitle}>{title}</Text>
+        <Text numberOfLines={1} style={styles.rowSub}>{subtitle}</Text>
+      </View>
+    </Pressable>
+  );
+}
+
+const useStyles = makeStyles((c) => ({
+  screen: { flex: 1, backgroundColor: c.surface },
+  header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingBottom: 12 },
+  title: { color: c.onSurface, fontSize: 26, fontWeight: "500" },
+  addBtn: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
+  row: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 16, paddingVertical: 8 },
+  pressed: { backgroundColor: c.surfaceSecondary },
+  cover: { width: 64, height: 64, borderRadius: 4, alignItems: "center", justifyContent: "center", backgroundColor: c.surfaceTertiary },
+  rowTitle: { color: c.onSurface, fontSize: 16 },
+  rowSub: { color: c.muted, fontSize: 13, marginTop: 4 },
+  empty: { alignItems: "center", padding: 32, gap: 8 },
+  emptyTitle: { color: c.onSurface, fontSize: 20, fontWeight: "500" },
+  emptyBtn: { marginTop: 16, backgroundColor: c.onSurface, borderRadius: 999, height: 48, paddingHorizontal: 24, justifyContent: "center" },
+  emptyBtnText: { color: c.surface, fontSize: 15, fontWeight: "500" },
+}));
+```
+
+## frontend/app/(tabs)/search.tsx
+```
+import { Ionicons } from "@react-native-vector-icons/ionicons";
+import { useQuery } from "@tanstack/react-query";
+import { Image } from "expo-image";
+import { router } from "expo-router";
+import { useEffect, useState } from "react";
+import { ActivityIndicator, FlatList, Pressable, Text, TextInput, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import { api, CardItem, Track, useLikedIds } from "@/src/api";
+import { Rail } from "@/src/components/media-card";
+import { MiniPlayer } from "@/src/components/mini-player";
+import { TrackRow } from "@/src/components/track-row";
+import { usesNativeTabs } from "@/src/navigation";
+import { usePlayer } from "@/src/player";
+import { makeStyles, useTheme } from "@/src/theme";
+
+type Genre = { id: string; name: string; picture: string };
+type Results = { tracks: Track[]; albums: CardItem[]; artists: CardItem[] };
+
+export default function Search() {
+  const styles = useStyles();
+  const { colors } = useTheme();
+  const insets = useSafeAreaInsets();
+  const bottomChrome = usesNativeTabs ? insets.bottom : 0;
+  const { playQueue, current } = usePlayer();
+  const likedIds = useLikedIds();
+  const [text, setText] = useState("");
+  const [q, setQ] = useState("");
+
+  useEffect(() => {
+    const t = setTimeout(() => setQ(text.trim()), 400);
+    return () => clearTimeout(t);
+  }, [text]);
+
+  const genres = useQuery({ queryKey: ["genres"], queryFn: () => api<Genre[]>("/genres") });
+  const results = useQuery({
+    queryKey: ["search", q],
+    queryFn: () => api<Results>(`/search?q=${encodeURIComponent(q)}`),
+    enabled: !!q,
+  });
+  const padBottom = bottomChrome + (current ? 88 : 24);
+
+  return (
+    <View style={styles.screen} testID="search-screen">
+      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
+        <Text style={styles.title}>Search</Text>
+        <View style={styles.inputWrap}>
+          <Ionicons name="search" size={20} color={colors.onSurfaceInverse} />
+          <TextInput
+            testID="search-input"
+            value={text}
+            onChangeText={setText}
+            placeholder="What do you want to listen to?"
+            placeholderTextColor="#535353"
+            style={styles.input}
+            returnKeyType="search"
+            autoCorrect={false}
+          />
+          {!!text && (
+            <Pressable testID="search-clear" onPress={() => setText("")} hitSlop={8}>
+              <Ionicons name="close" size={20} color={colors.onSurfaceInverse} />
+            </Pressable>
+          )}
+        </View>
+      </View>
+
+      {!q ? (
+        genres.isLoading ? (
+          <ActivityIndicator style={styles.center} color={colors.brandPrimary} />
+        ) : (
+          <FlatList
+            data={genres.data ?? []}
+            numColumns={2}
+            keyExtractor={(g) => g.id}
+            keyboardDismissMode="on-drag"
+            keyboardShouldPersistTaps="handled"
+            ListHeaderComponent={<Text style={styles.section}>Browse all</Text>}
+            contentContainerStyle={{ paddingHorizontal: 12, paddingBottom: padBottom }}
+            renderItem={({ item }) => (
+              <Pressable
+                testID={`genre-${item.id}`}
+                onPress={() => router.push(`/collection/genre/${item.id}`)}
+                style={({ pressed }) => [styles.genre, pressed && { opacity: 0.8 }]}
+              >
+                <Image source={{ uri: item.picture }} style={styles.genreImg} contentFit="cover" />
+                <View style={styles.genreScrim} />
+                <Text style={styles.genreText} numberOfLines={2}>{item.name}</Text>
+              </Pressable>
+            )}
+          />
+        )
+      ) : results.isLoading ? (
+        <ActivityIndicator style={styles.center} color={colors.brandPrimary} testID="search-loading" />
+      ) : results.isError ? (
+        <View style={styles.center}>
+          <Text style={styles.muted}>Search failed</Text>
+          <Pressable testID="search-retry" onPress={() => results.refetch()}>
+            <Text style={styles.link}>Try again</Text>
+          </Pressable>
+        </View>
+      ) : !results.data?.tracks.length && !results.data?.artists.length ? (
+        <View style={styles.center} testID="search-empty">
+          <Ionicons name="search" size={48} color={colors.muted} />
+          <Text style={styles.muted}>No results for &quot;{q}&quot;</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={results.data.tracks}
+          keyExtractor={(t) => t.id}
+          keyboardDismissMode="on-drag"
+          keyboardShouldPersistTaps="handled"
+          contentContainerStyle={{ paddingBottom: padBottom }}
+          ListHeaderComponent={
+            <View>
+              <Rail title="Artists" testID="search-artists" items={results.data.artists} />
+              <Rail title="Albums" testID="search-albums" items={results.data.albums} />
+              <Text style={[styles.section, { paddingHorizontal: 16 }]}>Songs</Text>
+            </View>
+          }
+          renderItem={({ item, index }) => (
+            <TrackRow track={item} liked={likedIds.has(item.id)} onPress={() => playQueue(results.data!.tracks, index)} />
+          )}
+        />
+      )}
+      <MiniPlayer bottom={bottomChrome + 8} />
+    </View>
+  );
+}
+
+const useStyles = makeStyles((c) => ({
+  screen: { flex: 1, backgroundColor: c.surface },
+  header: { paddingHorizontal: 16, paddingBottom: 12, gap: 16, backgroundColor: c.surface },
+  title: { color: c.onSurface, fontSize: 26, fontWeight: "500" },
+  inputWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: c.surfaceInverse,
+    borderRadius: 6,
+    paddingHorizontal: 12,
+    height: 48,
+    gap: 8,
+  },
+  input: { flex: 1, color: c.onSurfaceInverse, fontSize: 15, height: 48 },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12 },
+  muted: { color: c.muted, fontSize: 14 },
+  link: { color: c.brandPrimary, fontSize: 14, fontWeight: "500" },
+  section: { color: c.onSurface, fontSize: 18, fontWeight: "500", marginVertical: 12, marginHorizontal: 4 },
+  genre: { flex: 1, margin: 4, height: 100, borderRadius: 6, overflow: "hidden", backgroundColor: c.brandTertiary },
+  genreImg: { position: "absolute", width: "100%", height: "100%" },
+  genreScrim: { position: "absolute", width: "100%", height: "100%", backgroundColor: "rgba(0,0,0,0.45)" },
+  genreText: { color: "#FFFFFF", fontSize: 17, fontWeight: "500", padding: 12 },
+}));
+```
+
+## frontend/app/+html.tsx
+```
+// @ts-nocheck
+import { ScrollViewStyleReset } from "expo-router/html";
+import type { PropsWithChildren } from "react";
+
+export default function Root({ children }: PropsWithChildren) {
+  return (
+    <html lang="en" style={{ height: "100%" }}>
+      <head>
+        <meta charSet="utf-8" />
+        <meta httpEquiv="X-UA-Compatible" content="IE=edge" />
+        <meta
+          name="viewport"
+          content="width=device-width, initial-scale=1, shrink-to-fit=no"
+        />
+        {/*
+          Disable body scrolling on web to make ScrollView components work correctly.
+          If you want to enable scrolling, remove `ScrollViewStyleReset` and
+          set `overflow: auto` on the body style below.
+        */}
+        <ScrollViewStyleReset />
+        <style
+          dangerouslySetInnerHTML={{
+            __html: `
+              body > div:first-child { position: fixed !important; top: 0; left: 0; right: 0; bottom: 0; }
+              [role="tablist"] [role="tab"] * { overflow: visible !important; }
+              [role="heading"], [role="heading"] * { overflow: visible !important; }
+            `,
+          }}
+        />
+      </head>
+      <body
+        style={{
+          margin: 0,
+          height: "100%",
+          overflow: "hidden",
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
+        {children}
+      </body>
+    </html>
+  );
+}
+```
+
+## frontend/app/_layout.tsx
+```
+import { QueryClientProvider } from "@tanstack/react-query";
+import { Stack } from "expo-router";
+import { StatusBar } from "expo-status-bar";
+import { LogBox, StyleSheet } from "react-native";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { KeyboardProvider } from "react-native-keyboard-controller";
+
+import { ErrorBoundary } from "@/src/components/error-boundary";
+import { ToastProvider } from "@/src/components/toast";
+import { TrackSheetProvider } from "@/src/components/track-sheet";
+import { PlayerProvider } from "@/src/player";
+import { queryClient } from "@/src/query-client";
+import { useTheme } from "@/src/theme";
+
+// Disable logbox errors etc so that users can see the app
+// and agent works as expected.
+LogBox.ignoreAllLogs(true);
+
+export default function RootLayout() {
+  const { colors } = useTheme();
+  return (
+    <GestureHandlerRootView style={[styles.root, { backgroundColor: colors.surface }]}>
+      <ErrorBoundary>
+        <QueryClientProvider client={queryClient}>
+          <KeyboardProvider>
+            <PlayerProvider>
+              <ToastProvider>
+                <TrackSheetProvider>
+                  <StatusBar style="light" />
+                  <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.surface } }}>
+                    <Stack.Screen name="player" options={{ presentation: "fullScreenModal", animation: "slide_from_bottom" }} />
+                  </Stack>
+                </TrackSheetProvider>
+              </ToastProvider>
+            </PlayerProvider>
+          </KeyboardProvider>
+        </QueryClientProvider>
+      </ErrorBoundary>
+    </GestureHandlerRootView>
+  );
+}
+
+const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+  },
+});
+```
+
+## frontend/app/collection/[type]/[id].tsx
+```
+import { Ionicons } from "@react-native-vector-icons/ionicons";
+import { useQuery } from "@tanstack/react-query";
+import { Image } from "expo-image";
+import { LinearGradient } from "expo-linear-gradient";
+import { router, useLocalSearchParams } from "expo-router";
+import { useState } from "react";
+import { ActivityIndicator, FlatList, Modal, Pressable, Text, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import { api, Collection, del, Playlist, Track, useLikedIds } from "@/src/api";
+import { MiniPlayer } from "@/src/components/mini-player";
+import { useToast } from "@/src/components/toast";
+import { TrackRow } from "@/src/components/track-row";
+import { usePlayer } from "@/src/player";
+import { queryClient } from "@/src/query-client";
+import { makeStyles, useTheme } from "@/src/theme";
+
+const LIKED_COVER =
+  "https://images.unsplash.com/photo-1629197520635-16570fbd0bb3?crop=entropy&cs=srgb&fm=jpg&q=60&w=600";
+const PLAYLIST_COVER =
+  "https://images.unsplash.com/photo-1459749411175-04bf5292ceea?crop=entropy&cs=srgb&fm=jpg&q=60&w=600";
+
+async function fetchCollection(type: string, id: string): Promise<Collection> {
+  switch (type) {
+    case "album":
+      return api(`/albums/${id}`);
+    case "playlist":
+      return api(`/deezer-playlists/${id}`);
+    case "artist":
+      return api(`/artists/${id}`);
+    case "genre":
+      return api(`/genres/${id}`);
+    case "liked": {
+      const tracks = await api<Track[]>("/liked");
+      return { id, title: "Liked Songs", subtitle: `${tracks.length} songs`, cover: LIKED_COVER, type, tracks };
+    }
+    case "recent": {
+      const tracks = await api<Track[]>("/recent?limit=50");
+      return { id, title: "Recently played", subtitle: `${tracks.length} songs`, cover: tracks[0]?.cover || PLAYLIST_COVER, type, tracks };
+    }
+    default: {
+      const p = await api<Playlist>(`/playlists/${id}`);
+      return { id, title: p.name, subtitle: `${p.tracks.length} songs`, cover: p.tracks[0]?.cover || PLAYLIST_COVER, type, tracks: p.tracks };
+    }
+  }
+}
+
+export default function CollectionScreen() {
+  const { type, id } = useLocalSearchParams<{ type: string; id: string }>();
+  const styles = useStyles();
+  const { colors } = useTheme();
+  const insets = useSafeAreaInsets();
+  const toast = useToast();
+  const { playQueue, current, playing, toggle } = usePlayer();
+  const likedIds = useLikedIds();
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ["collection", type, id],
+    queryFn: () => fetchCollection(type, id),
+  });
+
+  const tracks = data?.tracks ?? [];
+  const isCurrent = !!current && tracks.some((t) => t.id === current.id);
+  const round = type === "artist";
+
+  const deletePlaylist = async () => {
+    await del(`/playlists/${id}`);
+    await queryClient.invalidateQueries({ queryKey: ["playlists"] });
+    setConfirmDelete(false);
+    toast("Playlist deleted");
+    router.back();
+  };
+
+  return (
+    <View style={styles.screen} testID="collection-screen">
+      {isLoading ? (
+        <ActivityIndicator style={styles.center} color={colors.brandPrimary} size="large" testID="collection-loading" />
+      ) : isError || !data ? (
+        <View style={styles.center}>
+          <Text style={styles.muted}>Could not load this page</Text>
+          <Pressable testID="collection-retry" onPress={() => refetch()}>
+            <Text style={styles.link}>Retry</Text>
+          </Pressable>
+        </View>
+      ) : (
+        <FlatList
+          data={tracks}
+          keyExtractor={(t) => t.id}
+          contentContainerStyle={{ paddingBottom: insets.bottom + (current ? 96 : 24) }}
+          ListHeaderComponent={
+            <View>
+              <LinearGradient
+                colors={[colors.brandTertiary, colors.surface]}
+                style={[styles.hero, { paddingTop: insets.top + 56 }]}
+              >
+                <Image source={{ uri: data.cover }} style={[styles.cover, round && styles.round]} contentFit="cover" transition={200} />
+              </LinearGradient>
+              <View style={styles.meta}>
+                <Text style={styles.title} numberOfLines={2} testID="collection-title">{data.title}</Text>
+                <Text style={styles.muted} numberOfLines={2}>{data.subtitle}</Text>
+                <View style={styles.actions}>
+                  {type === "mine" && (
+                    <Pressable testID="collection-delete-playlist" onPress={() => setConfirmDelete(true)} style={styles.iconBtn}>
+                      <Ionicons name="trash-outline" size={24} color={colors.muted} />
+                    </Pressable>
+                  )}
+                  <View style={{ flex: 1 }} />
+                  <Pressable
+                    testID="collection-shuffle"
+                    disabled={!tracks.length}
+                    onPress={() => playQueue([...tracks].sort(() => Math.random() - 0.5), 0)}
+                    style={styles.iconBtn}
+                  >
+                    <Ionicons name="shuffle" size={28} color={colors.muted} />
+                  </Pressable>
+                  <Pressable
+                    testID="collection-play"
+                    disabled={!tracks.length}
+                    onPress={() => (isCurrent ? toggle() : playQueue(tracks, 0))}
+                    style={({ pressed }) => [styles.play, pressed && { transform: [{ scale: 0.95 }] }, !tracks.length && { opacity: 0.4 }]}
+                  >
+                    <Ionicons name={isCurrent && playing ? "pause" : "play"} size={28} color={colors.onBrandPrimary} />
+                  </Pressable>
+                </View>
+              </View>
+            </View>
+          }
+          ListEmptyComponent={
+            <View style={styles.empty} testID="collection-empty">
+              <Ionicons name="musical-notes-outline" size={40} color={colors.muted} />
+              <Text style={styles.muted}>
+                {type === "liked" ? "Songs you like will appear here" : type === "mine" ? "Add songs via the ••• menu on any track" : "Nothing here yet"}
+              </Text>
+            </View>
+          }
+          renderItem={({ item, index }) => (
+            <TrackRow
+              track={item}
+              liked={likedIds.has(item.id)}
+              playlistId={type === "mine" ? id : undefined}
+              onPress={() => playQueue(tracks, index)}
+            />
+          )}
+        />
+      )}
+      <Pressable
+        testID="collection-back"
+        onPress={() => (router.canGoBack() ? router.back() : router.replace("/"))}
+        style={[styles.back, { top: insets.top + 8 }]}
+      >
+        <Ionicons name="chevron-back" size={24} color={colors.onSurface} />
+      </Pressable>
+      <MiniPlayer bottom={insets.bottom + 8} />
+      <Modal visible={confirmDelete} transparent animationType="fade" onRequestClose={() => setConfirmDelete(false)}>
+        <View style={styles.backdrop}>
+          <View style={styles.dialog} testID="delete-playlist-dialog">
+            <Text style={styles.dialogTitle}>Delete this playlist?</Text>
+            <Text style={styles.muted}>This can&apos;t be undone.</Text>
+            <View style={styles.dialogActions}>
+              <Pressable testID="delete-playlist-cancel" onPress={() => setConfirmDelete(false)} style={styles.dialogBtn}>
+                <Text style={styles.dialogBtnText}>Cancel</Text>
+              </Pressable>
+              <Pressable testID="delete-playlist-confirm" onPress={deletePlaylist} style={[styles.dialogBtn, styles.danger]}>
+                <Text style={[styles.dialogBtnText, { color: colors.onError }]}>Delete</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+const useStyles = makeStyles((c) => ({
+  screen: { flex: 1, backgroundColor: c.surface },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12 },
+  muted: { color: c.muted, fontSize: 14 },
+  link: { color: c.brandPrimary, fontSize: 15, fontWeight: "500" },
+  hero: { alignItems: "center", paddingBottom: 16 },
+  cover: { width: 220, height: 220, borderRadius: 6, backgroundColor: c.surfaceTertiary },
+  round: { borderRadius: 110 },
+  meta: { paddingHorizontal: 16, gap: 6 },
+  title: { color: c.onSurface, fontSize: 26, fontWeight: "500" },
+  actions: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 8, marginBottom: 8 },
+  iconBtn: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
+  play: { width: 56, height: 56, borderRadius: 28, backgroundColor: c.brandPrimary, alignItems: "center", justifyContent: "center" },
+  empty: { alignItems: "center", gap: 12, padding: 32 },
+  back: {
+    position: "absolute",
+    left: 12,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.7)", justifyContent: "center", padding: 24 },
+  dialog: { backgroundColor: c.surfaceTertiary, borderRadius: 20, padding: 24, gap: 8 },
+  dialogTitle: { color: c.onSurface, fontSize: 20, fontWeight: "500" },
+  dialogActions: { flexDirection: "row", justifyContent: "flex-end", gap: 12, marginTop: 16 },
+  dialogBtn: { height: 44, paddingHorizontal: 20, borderRadius: 999, justifyContent: "center", borderWidth: 1, borderColor: c.borderStrong },
+  danger: { backgroundColor: c.error, borderColor: c.error },
+  dialogBtnText: { color: c.onSurface, fontSize: 15, fontWeight: "500" },
+}));
+```
+
+## frontend/app/player.tsx
+```
+import { Ionicons } from "@react-native-vector-icons/ionicons";
+import { Image } from "expo-image";
+import { LinearGradient } from "expo-linear-gradient";
+import { router } from "expo-router";
+import { useState } from "react";
+import { ActivityIndicator, LayoutChangeEvent, Pressable, Text, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import { formatTime, useLikedIds, useToggleLike } from "@/src/api";
+import { useTrackSheet } from "@/src/components/track-sheet";
+import { usePlayer } from "@/src/player";
+import { makeStyles, useTheme } from "@/src/theme";
+
+export default function PlayerScreen() {
+  const styles = useStyles();
+  const { colors } = useTheme();
+  const insets = useSafeAreaInsets();
+  const p = usePlayer();
+  const likedIds = useLikedIds();
+  const toggleLike = useToggleLike();
+  const openSheet = useTrackSheet();
+  const [barWidth, setBarWidth] = useState(1);
+  const t = p.current;
+
+  const close = () => (router.canGoBack() ? router.back() : router.replace("/"));
+
+  if (!t) {
+    return (
+      <View style={[styles.screen, styles.center]}>
+        <Text style={styles.muted}>Nothing playing</Text>
+        <Pressable testID="player-close" onPress={close}>
+          <Text style={{ color: colors.brandPrimary, marginTop: 12 }}>Go back</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  const liked = likedIds.has(t.id);
+  const pct = Math.min(1, p.position / (p.duration || 30));
+
+  return (
+    <View style={styles.screen} testID="player-screen">
+      <Image source={{ uri: t.cover }} style={styles.bg} blurRadius={60} contentFit="cover" />
+      <LinearGradient colors={["rgba(0,0,0,0.35)", "rgba(0,0,0,0.85)", "#000000"]} style={styles.bg} />
+      <View style={[styles.content, { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 24 }]}>
+        <View style={styles.topBar}>
+          <Pressable testID="player-close" onPress={close} style={styles.iconBtn}>
+            <Ionicons name="chevron-down" size={28} color={colors.onSurface} />
+          </Pressable>
+          <View style={{ flex: 1, alignItems: "center" }}>
+            <Text style={styles.caption}>PLAYING FROM</Text>
+            <Text style={styles.captionStrong} numberOfLines={1}>{t.album}</Text>
+          </View>
+          <Pressable testID="player-more" onPress={() => openSheet(t)} style={styles.iconBtn}>
+            <Ionicons name="ellipsis-horizontal" size={24} color={colors.onSurface} />
+          </Pressable>
+        </View>
+
+        <View style={styles.artWrap}>
+          <Image source={{ uri: t.cover }} style={styles.art} contentFit="cover" transition={250} testID="player-artwork" />
+        </View>
+
+        <View style={styles.titleRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.title} numberOfLines={1} testID="player-title">{t.title}</Text>
+            <Pressable
+              testID="player-artist"
+              onPress={() => {
+                router.back();
+                router.push(`/collection/artist/${t.artist_id}`);
+              }}
+            >
+              <Text style={styles.artist} numberOfLines={1}>{t.artist}</Text>
+            </Pressable>
+          </View>
+          <Pressable testID="player-like" onPress={() => toggleLike.mutate({ track: t, liked })} style={styles.iconBtn}>
+            <Ionicons name={liked ? "heart" : "heart-outline"} size={28} color={liked ? colors.brandPrimary : colors.onSurface} />
+          </Pressable>
+        </View>
+
+        <Pressable
+          testID="player-progress"
+          onLayout={(e: LayoutChangeEvent) => setBarWidth(e.nativeEvent.layout.width)}
+          onPress={(e) => p.seek((e.nativeEvent.locationX / barWidth) * p.duration)}
+          style={styles.barHit}
+        >
+          <View style={styles.barTrack}>
+            <View style={[styles.barFill, { width: `${pct * 100}%` }]} />
+          </View>
+          <View style={[styles.knob, { left: pct * barWidth - 6 }]} />
+        </Pressable>
+        <View style={styles.times}>
+          <Text style={styles.time} testID="player-position">{formatTime(p.position)}</Text>
+          <Text style={styles.time}>-{formatTime(p.duration - p.position)}</Text>
+        </View>
+
+        <View style={styles.controls}>
+          <Pressable testID="player-shuffle" onPress={p.toggleShuffle} style={styles.iconBtn}>
+            <Ionicons name="shuffle" size={26} color={p.shuffle ? colors.brandPrimary : colors.onSurface} />
+          </Pressable>
+          <Pressable testID="player-prev" onPress={p.prev} style={styles.iconBtn}>
+            <Ionicons name="play-skip-back" size={32} color={colors.onSurface} />
+          </Pressable>
+          <Pressable
+            testID="player-toggle"
+            onPress={p.toggle}
+            style={({ pressed }) => [styles.playBtn, pressed && { transform: [{ scale: 0.94 }] }]}
+          >
+            {p.loading ? (
+              <ActivityIndicator color={colors.onSurfaceInverse} />
+            ) : (
+              <Ionicons name={p.playing ? "pause" : "play"} size={34} color={colors.onSurfaceInverse} />
+            )}
+          </Pressable>
+          <Pressable testID="player-next" onPress={p.next} style={styles.iconBtn}>
+            <Ionicons name="play-skip-forward" size={32} color={colors.onSurface} />
+          </Pressable>
+          <Pressable testID="player-repeat" onPress={p.toggleRepeat} style={styles.iconBtn}>
+            <Ionicons name="repeat" size={26} color={p.repeat ? colors.brandPrimary : colors.onSurface} />
+          </Pressable>
+        </View>
+
+        <Text style={styles.queue} testID="player-queue-info">
+          {p.index + 1} of {p.queue.length} · 30s preview
+        </Text>
+      </View>
+    </View>
+  );
+}
+
+const useStyles = makeStyles((c) => ({
+  screen: { flex: 1, backgroundColor: "#000000" },
+  center: { alignItems: "center", justifyContent: "center" },
+  muted: { color: c.muted, fontSize: 14 },
+  bg: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0 },
+  content: { flex: 1, paddingHorizontal: 24 },
+  topBar: { flexDirection: "row", alignItems: "center" },
+  iconBtn: { width: 48, height: 48, alignItems: "center", justifyContent: "center" },
+  caption: { color: c.muted, fontSize: 11, letterSpacing: 1 },
+  captionStrong: { color: c.onSurface, fontSize: 13, fontWeight: "500", marginTop: 2 },
+  artWrap: { flex: 1, justifyContent: "center", alignItems: "center", paddingVertical: 24 },
+  art: { width: "100%", aspectRatio: 1, maxHeight: 360, maxWidth: 360, borderRadius: 8, backgroundColor: c.surfaceTertiary },
+  titleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  title: { color: c.onSurface, fontSize: 24, fontWeight: "500" },
+  artist: { color: c.muted, fontSize: 16, marginTop: 4 },
+  barHit: { height: 32, justifyContent: "center", marginTop: 16 },
+  barTrack: { height: 4, borderRadius: 2, backgroundColor: "rgba(255,255,255,0.25)", overflow: "hidden" },
+  barFill: { height: 4, backgroundColor: c.onSurface },
+  knob: { position: "absolute", width: 12, height: 12, borderRadius: 6, backgroundColor: c.onSurface },
+  times: { flexDirection: "row", justifyContent: "space-between" },
+  time: { color: c.muted, fontSize: 12 },
+  controls: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 16 },
+  playBtn: { width: 68, height: 68, borderRadius: 34, backgroundColor: c.surfaceInverse, alignItems: "center", justifyContent: "center" },
+  queue: { color: c.muted, fontSize: 12, textAlign: "center", marginTop: 24 },
+}));
+```
+
+## frontend/src/api.ts
+```
+import { useMutation, useQuery } from "@tanstack/react-query";
+
+import { queryClient } from "@/src/query-client";
+
+const BASE = `${process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
+
+export type Track = {
+  id: string;
+  title: string;
+  artist: string;
+  artist_id: string;
+  album: string;
+  album_id: string;
+  cover: string;
+  cover_small: string;
+  preview: string;
+  duration: number;
+};
+
+export type CardItem = { id: string; title: string; subtitle: string; cover: string; type: "album" | "playlist" | "artist" };
+
+export type Collection = { id: string; title: string; subtitle: string; cover: string; type: string; tracks: Track[] };
+
+export type Playlist = { id: string; name: string; description: string; tracks: Track[]; updated_at: string };
+
+export type HomeData = {
+  recent: Track[];
+  top_tracks: Track[];
+  playlists: CardItem[];
+  albums: CardItem[];
+  artists: CardItem[];
+};
+
+export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    ...init,
+    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+  });
+  if (!res.ok) throw new Error(`Request failed (${res.status})`);
+  return res.json() as Promise<T>;
+}
+
+export const post = <T,>(path: string, body: unknown) => api<T>(path, { method: "POST", body: JSON.stringify(body) });
+export const del = <T,>(path: string) => api<T>(path, { method: "DELETE" });
+
+export function useLikedIds() {
+  const q = useQuery({ queryKey: ["liked-ids"], queryFn: () => api<string[]>("/liked/ids") });
+  return new Set(q.data ?? []);
+}
+
+export function useToggleLike() {
+  return useMutation({
+    mutationFn: ({ track, liked }: { track: Track; liked: boolean }) =>
+      liked ? del(`/liked/${track.id}`) : post("/liked", track),
+    onMutate: ({ track, liked }) => {
+      queryClient.setQueryData<string[]>(["liked-ids"], (old = []) =>
+        liked ? old.filter((id) => id !== track.id) : [...old, track.id],
+      );
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["liked-ids"] });
+      queryClient.invalidateQueries({ queryKey: ["collection", "liked"] });
+    },
+  });
+}
+
+export function usePlaylists() {
+  return useQuery({ queryKey: ["playlists"], queryFn: () => api<Playlist[]>("/playlists") });
+}
+
+export const formatTime = (sec: number) => {
+  const s = Math.max(0, Math.floor(sec || 0));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+};
+```
+
+## frontend/src/components/create-playlist-modal.tsx
+```
+import { useState } from "react";
+import { Modal, Pressable, Text, TextInput, View } from "react-native";
+import { KeyboardAvoidingView } from "react-native-keyboard-controller";
+
+import { Playlist, post } from "@/src/api";
+import { queryClient } from "@/src/query-client";
+import { makeStyles, useTheme } from "@/src/theme";
+
+type Props = { visible: boolean; onClose: () => void; onCreated?: (p: Playlist) => void };
+
+export function CreatePlaylistModal({ visible, onClose, onCreated }: Props) {
+  const styles = useStyles();
+  const { colors } = useTheme();
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const create = async () => {
+    if (!name.trim() || busy) return;
+    setBusy(true);
+    try {
+      const p = await post<Playlist>("/playlists", { name: name.trim() });
+      await queryClient.invalidateQueries({ queryKey: ["playlists"] });
+      setName("");
+      onCreated?.(p);
+      onClose();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <KeyboardAvoidingView behavior="padding" style={styles.backdrop}>
+        <Pressable style={styles.fill} onPress={onClose} testID="create-playlist-backdrop" />
+        <View style={styles.card} testID="create-playlist-modal">
+          <Text style={styles.title}>Give your playlist a name</Text>
+          <TextInput
+            testID="create-playlist-input"
+            value={name}
+            onChangeText={setName}
+            placeholder="My playlist"
+            placeholderTextColor={colors.muted}
+            style={styles.input}
+            autoFocus
+            returnKeyType="done"
+            onSubmitEditing={create}
+            maxLength={80}
+          />
+          <View style={styles.actions}>
+            <Pressable testID="create-playlist-cancel" onPress={onClose} style={styles.ghostBtn}>
+              <Text style={styles.ghostText}>Cancel</Text>
+            </Pressable>
+            <Pressable
+              testID="create-playlist-submit"
+              onPress={create}
+              disabled={!name.trim() || busy}
+              style={[styles.btn, (!name.trim() || busy) && styles.disabled]}
+            >
+              <Text style={styles.btnText}>{busy ? "Creating..." : "Create"}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
+const useStyles = makeStyles((c) => ({
+  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.7)", justifyContent: "center", padding: 24 },
+  fill: { ...({ position: "absolute", top: 0, left: 0, right: 0, bottom: 0 } as const) },
+  card: { backgroundColor: c.surfaceTertiary, borderRadius: 20, padding: 24, gap: 24 },
+  title: { color: c.onSurface, fontSize: 20, fontWeight: "500", textAlign: "center" },
+  input: {
+    color: c.onSurface,
+    fontSize: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: c.borderStrong,
+    paddingVertical: 8,
+    textAlign: "center",
+  },
+  actions: { flexDirection: "row", justifyContent: "center", gap: 16 },
+  ghostBtn: { height: 48, paddingHorizontal: 24, justifyContent: "center", borderRadius: 999, borderWidth: 1, borderColor: c.muted },
+  ghostText: { color: c.onSurface, fontSize: 16, fontWeight: "500" },
+  btn: { height: 48, paddingHorizontal: 32, justifyContent: "center", borderRadius: 999, backgroundColor: c.brandPrimary },
+  btnText: { color: c.onBrandPrimary, fontSize: 16, fontWeight: "500" },
+  disabled: { opacity: 0.5 },
+}));
+```
+
+## frontend/src/components/error-boundary.tsx
+```
+// App level error boundary, mounted once in app/_layout.tsx. A render crash
+// shows a reload screen instead of a blank app; the error is also logged so
+// it shows up in the Metro output. Do not mount additional boundaries.
+
+import { reloadAppAsync } from "expo";
+import { Component, type ErrorInfo, type PropsWithChildren, useState } from "react";
+import { Platform, Pressable, ScrollView, Text, View } from "react-native";
+
+import { makeStyles } from "@/src/theme";
+
+type ErrorBoundaryState = { error: Error | null };
+
+export class ErrorBoundary extends Component<PropsWithChildren, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo): void {
+    console.error("[ErrorBoundary] render crash:", error, info.componentStack ?? "");
+  }
+
+  resetError = (): void => {
+    this.setState({ error: null });
+  };
+
+  render() {
+    if (this.state.error) {
+      return <ErrorFallback error={this.state.error} resetError={this.resetError} />;
+    }
+    return this.props.children;
+  }
+}
+
+function ErrorFallback({ error, resetError }: { error: Error; resetError: () => void }) {
+  const styles = useStyles();
+  const [showDetails, setShowDetails] = useState(false);
+
+  const handleReload = async () => {
+    try {
+      await reloadAppAsync();
+    } catch {
+      // Reload is unavailable in some environments; retry the render instead.
+      resetError();
+    }
+  };
+
+  return (
+    <View style={styles.container} testID="error-fallback">
+      <View style={styles.content}>
+        <Text style={styles.title}>Something went wrong</Text>
+        <Text style={styles.message}>Please reload the app to continue.</Text>
+        {__DEV__ ? <Text style={styles.devMessage}>{error.message}</Text> : null}
+        <Pressable
+          onPress={handleReload}
+          testID="error-fallback-reload"
+          accessibilityRole="button"
+          style={({ pressed }) => [styles.button, pressed && styles.buttonPressed]}
+        >
+          <Text style={styles.buttonText}>Reload app</Text>
+        </Pressable>
+        {__DEV__ ? (
+          <Pressable onPress={() => setShowDetails((v) => !v)} accessibilityRole="button" hitSlop={8}>
+            <Text style={styles.detailsToggle}>{showDetails ? "Hide details" : "Show details"}</Text>
+          </Pressable>
+        ) : null}
+      </View>
+      {__DEV__ && showDetails ? (
+        <ScrollView style={styles.details} contentContainerStyle={styles.detailsContent}>
+          <Text selectable style={styles.detailsText}>
+            {error.stack ?? error.message}
+          </Text>
+        </ScrollView>
+      ) : null}
+    </View>
+  );
+}
+
+const useStyles = makeStyles((colors) => ({
+  container: {
+    flex: 1,
+    backgroundColor: colors.surface,
+    justifyContent: "center",
+    padding: 24,
+  },
+  content: {
+    alignItems: "center",
+    gap: 12,
+  },
+  title: {
+    color: colors.onSurface,
+    fontSize: 22,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  message: {
+    color: colors.muted,
+    fontSize: 15,
+    textAlign: "center",
+  },
+  devMessage: {
+    color: colors.error,
+    fontSize: 13,
+    textAlign: "center",
+  },
+  button: {
+    marginTop: 8,
+    backgroundColor: colors.brandPrimary,
+    borderRadius: 12,
+    paddingHorizontal: 24,
+    paddingVertical: 14,
+    minWidth: 180,
+  },
+  buttonPressed: {
+    opacity: 0.85,
+  },
+  buttonText: {
+    color: colors.onBrandPrimary,
+    fontSize: 15,
+    fontWeight: "600",
+    textAlign: "center",
+  },
+  detailsToggle: {
+    color: colors.muted,
+    fontSize: 13,
+    textDecorationLine: "underline",
+    paddingVertical: 8,
+  },
+  details: {
+    marginTop: 16,
+    maxHeight: 260,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.surfaceSecondary,
+  },
+  detailsContent: {
+    padding: 12,
+  },
+  detailsText: {
+    color: colors.onSurfaceSecondary,
+    fontSize: 12,
+    lineHeight: 18,
+    fontFamily: Platform.select({ ios: "Menlo", default: "monospace" }),
+  },
+}));
+```
+
+## frontend/src/components/media-card.tsx
+```
+import { Image } from "expo-image";
+import { router } from "expo-router";
+import { FlatList, Pressable, Text, View } from "react-native";
+
+import { CardItem } from "@/src/api";
+import { makeStyles } from "@/src/theme";
+
+export function MediaCard({ item, onPress }: { item: Pick<CardItem, "id" | "title" | "subtitle" | "cover" | "type">; onPress?: () => void }) {
+  const styles = useStyles();
+  const round = item.type === "artist";
+  return (
+    <Pressable
+      testID={`card-${item.type}-${item.id}`}
+      onPress={onPress ?? (() => router.push(`/collection/${item.type}/${item.id}`))}
+      style={({ pressed }) => [styles.card, pressed && { opacity: 0.7 }]}
+    >
+      <Image source={{ uri: item.cover }} style={[styles.cover, round && styles.round]} contentFit="cover" transition={200} />
+      <Text numberOfLines={round ? 1 : 2} style={[styles.title, round && { textAlign: "center" }]}>{item.title}</Text>
+      {!round && <Text numberOfLines={1} style={styles.sub}>{item.subtitle}</Text>}
+    </Pressable>
+  );
+}
+
+export function Rail({ title, items, testID, onItemPress }: {
+  title: string;
+  items: Pick<CardItem, "id" | "title" | "subtitle" | "cover" | "type">[];
+  testID: string;
+  onItemPress?: (index: number) => void;
+}) {
+  const styles = useStyles();
+  if (!items.length) return null;
+  return (
+    <View style={styles.rail} testID={testID}>
+      <Text style={styles.railTitle}>{title}</Text>
+      <FlatList
+        horizontal
+        data={items}
+        keyExtractor={(i) => `${i.type}-${i.id}`}
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.railContent}
+        renderItem={({ item, index }) => (
+          <MediaCard item={item} onPress={onItemPress ? () => onItemPress(index) : undefined} />
+        )}
+      />
+    </View>
+  );
+}
+
+const useStyles = makeStyles((c) => ({
+  card: { width: 140, gap: 6 },
+  cover: { width: 140, height: 140, borderRadius: 6, backgroundColor: c.surfaceTertiary },
+  round: { borderRadius: 70 },
+  title: { color: c.onSurface, fontSize: 14, fontWeight: "500" },
+  sub: { color: c.muted, fontSize: 12 },
+  rail: { marginTop: 24 },
+  railTitle: { color: c.onSurface, fontSize: 22, fontWeight: "500", paddingHorizontal: 16, marginBottom: 12 },
+  railContent: { paddingHorizontal: 16, gap: 16 },
+}));
+```
+
+## frontend/src/components/mini-player.tsx
+```
+import { Ionicons } from "@react-native-vector-icons/ionicons";
+import { Image } from "expo-image";
+import { router } from "expo-router";
+import { ActivityIndicator, Pressable, Text, View } from "react-native";
+import Animated, { FadeInDown } from "react-native-reanimated";
+
+import { useLikedIds, useToggleLike } from "@/src/api";
+import { usePlayer } from "@/src/player";
+import { makeStyles, useTheme } from "@/src/theme";
+
+// `bottom` given => floats absolutely (NativeTabs / stack screens); otherwise sits in layout above the JS tab bar.
+export function MiniPlayer({ bottom }: { bottom?: number }) {
+  const styles = useStyles();
+  const { colors } = useTheme();
+  const { current, playing, loading, toggle, position, duration } = usePlayer();
+  const likedIds = useLikedIds();
+  const toggleLike = useToggleLike();
+  if (!current) return null;
+  const liked = likedIds.has(current.id);
+  const pct = Math.min(100, (position / (duration || 30)) * 100);
+
+  return (
+    <Animated.View
+      entering={FadeInDown}
+      style={[styles.wrap, bottom !== undefined && { position: "absolute", left: 0, right: 0, bottom }]}
+    >
+      <Pressable testID="mini-player" onPress={() => router.push("/player")} style={styles.bar}>
+        <Image source={{ uri: current.cover_small }} style={styles.cover} />
+        <View style={styles.info}>
+          <Text numberOfLines={1} style={styles.title} testID="mini-player-title">{current.title}</Text>
+          <Text numberOfLines={1} style={styles.artist}>{current.artist}</Text>
+        </View>
+        <Pressable
+          testID="mini-player-like"
+          hitSlop={6}
+          style={styles.btn}
+          onPress={() => toggleLike.mutate({ track: current, liked })}
+        >
+          <Ionicons name={liked ? "heart" : "heart-outline"} size={22} color={liked ? colors.brandPrimary : colors.onSurface} />
+        </Pressable>
+        <Pressable testID="mini-player-toggle" hitSlop={6} style={styles.btn} onPress={toggle}>
+          {loading ? (
+            <ActivityIndicator color={colors.onSurface} />
+          ) : (
+            <Ionicons name={playing ? "pause" : "play"} size={24} color={colors.onSurface} />
+          )}
+        </Pressable>
+        <View style={styles.track}>
+          <View style={[styles.progress, { width: `${pct}%` }]} />
+        </View>
+      </Pressable>
+    </Animated.View>
+  );
+}
+
+const useStyles = makeStyles((c) => ({
+  wrap: { paddingHorizontal: 8, paddingBottom: 4 },
+  bar: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: c.brandTertiary,
+    borderRadius: 6,
+    padding: 8,
+    gap: 8,
+    overflow: "hidden",
+  },
+  cover: { width: 40, height: 40, borderRadius: 4, backgroundColor: c.surfaceTertiary },
+  info: { flex: 1 },
+  title: { color: c.onBrandTertiary, fontSize: 14, fontWeight: "500" },
+  artist: { color: c.onBrandTertiary, opacity: 0.75, fontSize: 12, marginTop: 2 },
+  btn: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
+  track: { position: "absolute", left: 8, right: 8, bottom: 0, height: 2, backgroundColor: "rgba(255,255,255,0.25)" },
+  progress: { height: 2, backgroundColor: c.onBrandTertiary },
+}));
+```
+
+## frontend/src/components/toast.tsx
+```
+import { createContext, ReactNode, useCallback, useContext, useRef, useState } from "react";
+import { Text } from "react-native";
+import Animated, { FadeInDown, FadeOutDown } from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import { makeStyles } from "@/src/theme";
+
+const ToastContext = createContext<(msg: string) => void>(() => {});
+
+export function ToastProvider({ children }: { children: ReactNode }) {
+  const styles = useStyles();
+  const insets = useSafeAreaInsets();
+  const [msg, setMsg] = useState<string | null>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const show = useCallback((m: string) => {
+    setMsg(m);
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(() => setMsg(null), 2200);
+  }, []);
+
+  return (
+    <ToastContext.Provider value={show}>
+      {children}
+      {msg && (
+        <Animated.View
+          entering={FadeInDown}
+          exiting={FadeOutDown}
+          pointerEvents="none"
+          style={[styles.toast, { bottom: insets.bottom + 140 }]}
+          testID="toast"
+        >
+          <Text style={styles.text}>{msg}</Text>
+        </Animated.View>
+      )}
+    </ToastContext.Provider>
+  );
+}
+
+export const useToast = () => useContext(ToastContext);
+
+const useStyles = makeStyles((c) => ({
+  toast: {
+    position: "absolute",
+    alignSelf: "center",
+    backgroundColor: c.surfaceInverse,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 12,
+    maxWidth: "90%",
+  },
+  text: { color: c.onSurfaceInverse, fontSize: 14, fontWeight: "500" },
+}));
+```
+
+## frontend/src/components/track-row.tsx
+```
+import { Ionicons } from "@react-native-vector-icons/ionicons";
+import { Image } from "expo-image";
+import { memo } from "react";
+import { Pressable, Text, View } from "react-native";
+
+import { Track } from "@/src/api";
+import { useTrackSheet } from "@/src/components/track-sheet";
+import { usePlayer } from "@/src/player";
+import { makeStyles, useTheme } from "@/src/theme";
+
+type Props = { track: Track; onPress: () => void; playlistId?: string; liked?: boolean };
+
+function TrackRowBase({ track, onPress, playlistId, liked }: Props) {
+  const styles = useStyles();
+  const { colors } = useTheme();
+  const { current } = usePlayer();
+  const openSheet = useTrackSheet();
+  const active = current?.id === track.id;
+
+  return (
+    <Pressable
+      testID={`track-row-${track.id}`}
+      onPress={onPress}
+      style={({ pressed }) => [styles.row, pressed && styles.pressed]}
+    >
+      <Image source={{ uri: track.cover_small || track.cover }} style={styles.cover} contentFit="cover" transition={150} />
+      <View style={styles.info}>
+        <Text numberOfLines={1} style={[styles.title, active && { color: colors.brandPrimary }]}>
+          {track.title}
+        </Text>
+        <View style={styles.subRow}>
+          {liked && <Ionicons name="heart" size={12} color={colors.brandPrimary} />}
+          <Text numberOfLines={1} style={styles.artist}>
+            {track.artist}
+          </Text>
+        </View>
+      </View>
+      <Pressable
+        testID={`track-more-${track.id}`}
+        hitSlop={8}
+        onPress={() => openSheet(track, playlistId)}
+        style={styles.more}
+      >
+        <Ionicons name="ellipsis-vertical" size={18} color={colors.muted} />
+      </Pressable>
+    </Pressable>
+  );
+}
+
+export const TrackRow = memo(TrackRowBase);
+
+const useStyles = makeStyles((c) => ({
+  row: { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 8, gap: 12 },
+  pressed: { backgroundColor: c.surfaceSecondary },
+  cover: { width: 48, height: 48, borderRadius: 4, backgroundColor: c.surfaceTertiary },
+  info: { flex: 1, gap: 4 },
+  title: { color: c.onSurface, fontSize: 16 },
+  subRow: { flexDirection: "row", alignItems: "center", gap: 4 },
+  artist: { color: c.muted, fontSize: 13, flexShrink: 1 },
+  more: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
+}));
+```
+
+## frontend/src/components/track-sheet.tsx
+```
+import { Ionicons } from "@react-native-vector-icons/ionicons";
+import { Image } from "expo-image";
+import { router } from "expo-router";
+import { createContext, ReactNode, useCallback, useContext, useState } from "react";
+import { Modal, Pressable, ScrollView, Text, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import { del, post, Track, useLikedIds, usePlaylists, useToggleLike } from "@/src/api";
+import { CreatePlaylistModal } from "@/src/components/create-playlist-modal";
+import { useToast } from "@/src/components/toast";
+import { queryClient } from "@/src/query-client";
+import { makeStyles, useTheme } from "@/src/theme";
+
+type Open = (track: Track, playlistId?: string) => void;
+const SheetContext = createContext<Open>(() => {});
+export const useTrackSheet = () => useContext(SheetContext);
+
+export function TrackSheetProvider({ children }: { children: ReactNode }) {
+  const styles = useStyles();
+  const insets = useSafeAreaInsets();
+  const toast = useToast();
+  const likedIds = useLikedIds();
+  const toggleLike = useToggleLike();
+  const { data: playlists = [] } = usePlaylists();
+  const [track, setTrack] = useState<Track | null>(null);
+  const [playlistId, setPlaylistId] = useState<string | undefined>();
+  const [mode, setMode] = useState<"menu" | "add">("menu");
+  const [creating, setCreating] = useState(false);
+
+  const open = useCallback<Open>((t, pid) => {
+    setTrack(t);
+    setPlaylistId(pid);
+    setMode("menu");
+  }, []);
+  const close = () => setTrack(null);
+
+  const addTo = async (pid: string, name: string) => {
+    if (!track) return;
+    await post(`/playlists/${pid}/tracks`, track);
+    queryClient.invalidateQueries({ queryKey: ["playlists"] });
+    queryClient.invalidateQueries({ queryKey: ["collection", "mine", pid] });
+    toast(`Added to ${name}`);
+    close();
+  };
+
+  const liked = track ? likedIds.has(track.id) : false;
+
+  return (
+    <SheetContext.Provider value={open}>
+      {children}
+      <Modal visible={!!track && !creating} transparent animationType="slide" onRequestClose={close}>
+        <Pressable style={styles.backdrop} onPress={close} testID="track-sheet-backdrop" />
+        {track && (
+          <View style={[styles.sheet, { paddingBottom: insets.bottom + 16 }]} testID="track-sheet">
+            <View style={styles.handle} />
+            <View style={styles.header}>
+              <Image source={{ uri: track.cover_small }} style={styles.cover} />
+              <View style={{ flex: 1 }}>
+                <Text numberOfLines={1} style={styles.title}>{track.title}</Text>
+                <Text numberOfLines={1} style={styles.sub}>{track.artist}</Text>
+              </View>
+            </View>
+            {mode === "menu" ? (
+              <View>
+                <Item
+                  id="sheet-like-button"
+                  icon={liked ? "heart" : "heart-outline"}
+                  label={liked ? "Remove from Liked Songs" : "Add to Liked Songs"}
+                  onPress={() => {
+                    toggleLike.mutate({ track, liked });
+                    toast(liked ? "Removed from Liked Songs" : "Added to Liked Songs");
+                    close();
+                  }}
+                />
+                <Item id="sheet-add-playlist-button" icon="add-circle-outline" label="Add to playlist" onPress={() => setMode("add")} />
+                {playlistId && (
+                  <Item
+                    id="sheet-remove-playlist-button"
+                    icon="remove-circle-outline"
+                    label="Remove from this playlist"
+                    onPress={async () => {
+                      await del(`/playlists/${playlistId}/tracks/${track.id}`);
+                      queryClient.invalidateQueries({ queryKey: ["collection", "mine", playlistId] });
+                      queryClient.invalidateQueries({ queryKey: ["playlists"] });
+                      toast("Removed from playlist");
+                      close();
+                    }}
+                  />
+                )}
+                <Item
+                  id="sheet-go-album-button"
+                  icon="disc-outline"
+                  label="Go to album"
+                  onPress={() => {
+                    close();
+                    router.push(`/collection/album/${track.album_id}`);
+                  }}
+                />
+                <Item
+                  id="sheet-go-artist-button"
+                  icon="person-outline"
+                  label="Go to artist"
+                  onPress={() => {
+                    close();
+                    router.push(`/collection/artist/${track.artist_id}`);
+                  }}
+                />
+              </View>
+            ) : (
+              <ScrollView style={{ maxHeight: 360 }}>
+                <Item id="sheet-new-playlist-button" icon="add" label="New playlist" onPress={() => setCreating(true)} />
+                {playlists.map((p) => (
+                  <Item key={p.id} id={`sheet-playlist-${p.id}`} icon="musical-notes-outline" label={p.name} onPress={() => addTo(p.id, p.name)} />
+                ))}
+              </ScrollView>
+            )}
+          </View>
+        )}
+      </Modal>
+      <CreatePlaylistModal
+        visible={creating}
+        onClose={() => setCreating(false)}
+        onCreated={(p) => addTo(p.id, p.name)}
+      />
+    </SheetContext.Provider>
+  );
+}
+
+function Item({ icon, label, onPress, id }: { icon: any; label: string; onPress: () => void; id: string }) {
+  const styles = useStyles();
+  const { colors } = useTheme();
+  return (
+    <Pressable testID={id} onPress={onPress} style={({ pressed }) => [styles.item, pressed && styles.pressed]}>
+      <Ionicons name={icon} size={22} color={colors.onSurface} />
+      <Text style={styles.itemText}>{label}</Text>
+    </Pressable>
+  );
+}
+
+const useStyles = makeStyles((c) => ({
+  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.6)" },
+  sheet: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: c.surfaceTertiary,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingTop: 8,
+  },
+  handle: { alignSelf: "center", width: 40, height: 4, borderRadius: 2, backgroundColor: c.borderStrong, marginBottom: 8 },
+  header: { flexDirection: "row", alignItems: "center", gap: 12, padding: 16, borderBottomWidth: 1, borderBottomColor: c.borderStrong },
+  cover: { width: 48, height: 48, borderRadius: 4 },
+  title: { color: c.onSurface, fontSize: 16, fontWeight: "500" },
+  sub: { color: c.muted, fontSize: 13, marginTop: 2 },
+  item: { flexDirection: "row", alignItems: "center", gap: 16, paddingHorizontal: 16, height: 52 },
+  pressed: { backgroundColor: c.borderStrong },
+  itemText: { color: c.onSurface, fontSize: 16 },
+}));
+```
+
+## frontend/src/navigation.ts
+```
+import { Platform } from "react-native";
+
+export const usesNativeTabs = Platform.OS === "ios" && parseInt(String(Platform.Version), 10) >= 26;
+```
+
+## frontend/src/player.tsx
+```
+import { setAudioModeAsync, useAudioPlayer, useAudioPlayerStatus } from "expo-audio";
+import { createContext, ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+
+import { api, post, Track } from "@/src/api";
+import { queryClient } from "@/src/query-client";
+
+type PlayerState = {
+  current?: Track;
+  queue: Track[];
+  index: number;
+  playing: boolean;
+  loading: boolean;
+  position: number;
+  duration: number;
+  shuffle: boolean;
+  repeat: boolean;
+  playQueue: (tracks: Track[], index: number) => void;
+  toggle: () => void;
+  next: () => void;
+  prev: () => void;
+  seek: (sec: number) => void;
+  toggleShuffle: () => void;
+  toggleRepeat: () => void;
+};
+
+const PlayerContext = createContext<PlayerState | null>(null);
+
+const shuffled = <T,>(arr: T[]) => [...arr].sort(() => Math.random() - 0.5);
+
+export function PlayerProvider({ children }: { children: ReactNode }) {
+  const player = useAudioPlayer(null, { updateInterval: 500 });
+  const status = useAudioPlayerStatus(player);
+  const [queue, setQueue] = useState<Track[]>([]);
+  const [index, setIndex] = useState(-1);
+  const [shuffle, setShuffle] = useState(false);
+  const [repeat, setRepeat] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const token = useRef(0);
+
+  useEffect(() => {
+    setAudioModeAsync({ playsInSilentMode: true }).catch(() => {});
+  }, []);
+
+  const load = useCallback(
+    async (tracks: Track[], i: number) => {
+      const t = tracks[i];
+      if (!t) return;
+      const my = ++token.current;
+      setQueue(tracks);
+      setIndex(i);
+      setLoading(true);
+      let uri = t.preview;
+      try {
+        uri = (await api<Track>(`/tracks/${t.id}`)).preview; // Deezer preview links expire, refresh before play
+      } catch {}
+      if (my !== token.current) return;
+      player.replace({ uri });
+      player.play();
+      setLoading(false);
+      post("/recent", t)
+        .then(() => {
+          queryClient.invalidateQueries({ queryKey: ["home"] });
+          queryClient.invalidateQueries({ queryKey: ["collection", "recent"] });
+        })
+        .catch(() => {});
+    },
+    [player],
+  );
+
+  const playQueue = useCallback(
+    (tracks: Track[], i: number) => {
+      if (shuffle) {
+        const first = tracks[i];
+        load([first, ...shuffled(tracks.filter((_, j) => j !== i))], 0);
+      } else load(tracks, i);
+    },
+    [load, shuffle],
+  );
+
+  const next = useCallback(() => {
+    if (index < queue.length - 1) load(queue, index + 1);
+    else if (queue.length) load(queue, 0);
+  }, [index, queue, load]);
+
+  const prev = useCallback(() => {
+    if (status.currentTime > 3 || index === 0) player.seekTo(0);
+    else load(queue, index - 1);
+  }, [status.currentTime, index, queue, load, player]);
+
+  useEffect(() => {
+    if (!status.didJustFinish) return;
+    if (repeat) {
+      player.seekTo(0);
+      player.play();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    } else if (index < queue.length - 1) next();
+    else {
+      player.pause();
+      player.seekTo(0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status.didJustFinish]);
+
+  const value = useMemo<PlayerState>(
+    () => ({
+      current: queue[index],
+      queue,
+      index,
+      playing: status.playing,
+      loading: loading || (!!queue[index] && !status.isLoaded),
+      position: status.currentTime,
+      duration: status.duration || queue[index]?.duration || 30,
+      shuffle,
+      repeat,
+      playQueue,
+      toggle: () => (status.playing ? player.pause() : player.play()),
+      next,
+      prev,
+      seek: (sec: number) => player.seekTo(sec),
+      toggleShuffle: () =>
+        setShuffle((s) => {
+          if (!s && queue.length > 1) {
+            const cur = queue[index];
+            setQueue([cur, ...shuffled(queue.filter((_, j) => j !== index))]);
+            setIndex(0);
+          }
+          return !s;
+        }),
+      toggleRepeat: () => setRepeat((r) => !r),
+    }),
+    [queue, index, status, loading, shuffle, repeat, playQueue, next, prev, player],
+  );
+
+  return <PlayerContext.Provider value={value}>{children}</PlayerContext.Provider>;
+}
+
+export function usePlayer() {
+  const ctx = useContext(PlayerContext);
+  if (!ctx) throw new Error("usePlayer must be inside PlayerProvider");
+  return ctx;
+}
+```
+
+## frontend/src/query-client.ts
+```
+// One QueryClient for the whole app; the provider in app/_layout.tsx uses
+// this instance. Import it for cache calls outside components, for example
+// queryClient.invalidateQueries or setQueryData in websocket or push
+// handlers; inside components useQueryClient() returns this same instance.
+import { QueryClient } from "@tanstack/react-query";
+
+export const queryClient = new QueryClient();
+```
+
+## frontend/src/theme.ts
+```
+// Design tokens for this app. Light theme only.Always modify the colors and theme to Dark, Light or Dark and Light according to the design guidelines.
+//
+// The keys match the "color" block of /app/design_guidelines.json. Fill the
+// values from that file (or from the user's brand colors). Keep every key; do
+// not add a second theme or colors file; do not write color literals in
+// components.
+//
+// How the names work: a plain key is a background, and its `on` partner is the
+// text or icon color that sits on top of it. Always use them as a pair.
+//   <View style={{ backgroundColor: colors.brandPrimary }}>
+//     <Text style={{ color: colors.onBrandPrimary }}>Continue</Text>
+//   </View>
+//
+// Styling a screen or component: build the sheet with makeStyles so colors
+// and layout live together and follow the active scheme:
+//   const useStyles = makeStyles((colors) => ({
+//     card: { backgroundColor: colors.surfaceSecondary, padding: 16 },
+//     title: { color: colors.onSurfaceSecondary, fontSize: 16 },
+//   }));
+//   function Screen() {
+//     const styles = useStyles();
+//     return <View style={styles.card}><Text style={styles.title}>Hi</Text></View>;
+//   }
+// For color props that are not styles (icon color, placeholderTextColor,
+// ActivityIndicator) read useTheme().colors inside the component.
+// Never call StyleSheet.create with color values at module level; it cannot
+// follow the scheme.
+//
+// To support dark mode later: add `dark` to `themes` with every key filled.
+// Nothing else changes; the device setting takes over automatically.
+// Feel free to add as many new colors as you need to support the design guidelines.
+
+import { useMemo } from "react";
+import { Appearance, StyleSheet, useColorScheme } from "react-native";
+
+export type ColorScheme = "light" | "dark";
+
+const light = {
+  // ---------------------------------------------------------------------------
+  // Surfaces: backgrounds, from the screen down to small fills.
+  // Each `on` key is the text and icon color for that background.
+  // ---------------------------------------------------------------------------
+  surface: "#121212", // primary canvas, most of every screen
+  onSurface: "#FFFFFF", // text and icons on the canvas
+  surfaceSecondary: "#1E1E1E", // cards, sheets, list rows
+  onSurfaceSecondary: "#FFFFFF", // text and icons on cards, sheets, rows
+  surfaceTertiary: "#282828", // input backgrounds, chips, deepest nesting
+  onSurfaceTertiary: "#FFFFFF", // text on inputs and chips; also muted text
+  surfaceInverse: "#FFFFFF", // tooltips, snackbars, anything popping against the theme
+  onSurfaceInverse: "#000000", // text and icons on the inverse surface
+  muted: "#B3B3B3", // subdued text on surface: captions, timestamps, placeholders
+
+  // ---------------------------------------------------------------------------
+  // Brand: the identity color and the fills built from it.
+  // Neutral by default; replace with the design guidelines values.
+  // ---------------------------------------------------------------------------
+  brand: "#1DB954", // base hue, anchor only; Primary, Secondary, Tertiary are weights of it
+  onBrand: "#000000", // text and icons placed directly on brand
+  brandPrimary: "#1ED760", // primary CTA, active tab indicator, selected states
+  onBrandPrimary: "#000000", // text and icons on brandPrimary
+  brandSecondary: "#1FDF64", // secondary CTA, less prominent accents
+  onBrandSecondary: "#000000", // text and icons on brandSecondary
+  brandTertiary: "#117030", // chips, tags, badges, subtle brand moments
+  onBrandTertiary: "#FFFFFF", // text and icons on brandTertiary
+
+  // ---------------------------------------------------------------------------
+  // Status: semantic only, never decorative. Fill for badges, banners and
+  // toasts; the `on` key is text on that fill. The plain key is also safe as
+  // text on `surface`.
+  // ---------------------------------------------------------------------------
+  success: "#1ED760",
+  onSuccess: "#000000",
+  warning: "#FFA42B",
+  onWarning: "#000000",
+  error: "#E22134",
+  onError: "#FFFFFF",
+  info: "#2D88FF",
+  onInfo: "#FFFFFF",
+
+  // ---------------------------------------------------------------------------
+  // Lines
+  // ---------------------------------------------------------------------------
+  border: "#282828", // hairline outline, 0.5pt or 1pt max: inputs, cards
+  borderStrong: "#3E3E3E", // focus rings, selected outlines, 1.5pt max
+  divider: "#282828", // subtle list separators
+};
+
+export type ThemeColors = typeof light;
+
+export const defaultScheme = "dark" satisfies ColorScheme;
+
+export const themes: { light: ThemeColors; dark?: ThemeColors } = { light, dark: light };
+
+// In-app theme toggle, only after `dark` exists in `themes`. Call
+// setColorScheme("dark"), setColorScheme("light"), or setColorScheme(null) to
+// follow the device. Every useTheme() consumer re-renders. Persisting the
+// choice and re-applying it on launch is the toggle's job.
+export function setColorScheme(scheme: ColorScheme | null) {
+  // RN 0.86 re-reads the device scheme only for the literal "unspecified";
+  // null would pin useColorScheme() to null and the app to light.
+  Appearance.setColorScheme?.(scheme ?? "unspecified");
+}
+
+// Keep native surfaces (alerts, pickers, navigation chrome) on the schemes this
+// app ships: light only forces light; once `dark` exists the device decides.
+// Optional call because react-native-web does not implement it.
+setColorScheme?.("dark");
+
+export function useTheme(): { scheme: ColorScheme; colors: ThemeColors } {
+  const system = useColorScheme();
+  const scheme: ColorScheme = (system === "light" || system === "dark") && themes[system] ? system : defaultScheme;
+  return { scheme, colors: themes[scheme] ?? themes.light };
+}
+
+// Themed StyleSheet: returns a hook that builds the sheet from the active
+// scheme's colors and memoizes it until the scheme changes.
+export function makeStyles<T extends StyleSheet.NamedStyles<T> | StyleSheet.NamedStyles<any>>(
+  factory: (colors: ThemeColors) => T & StyleSheet.NamedStyles<any>,
+): () => T {
+  return function useStyles(): T {
+    const { colors } = useTheme();
+    return useMemo(() => StyleSheet.create(factory(colors)), [colors]);
+  };
+}
+
+
+```
+
+## frontend/src/utils/storage/index.ts
+```
+// Native storage (Metro auto-picks index.web.ts on web — do NOT add Platform.OS checks).
+//
+// Import the ready-made singleton BY NAME and call methods on it — never a default
+// import, never the methods bare:
+//   import { storage } from "@/src/utils/storage";
+//   await storage.getItem(key, fallback);      // the `fallback` arg is REQUIRED
+//
+// Namespaces: general KV -> getItem/setItem/removeItem (AsyncStorage);
+//             tokens/secrets -> secureGet/secureSet/secureRemove (Keychain).
+// Values are auto JSON-serialized (string|number|boolean|null) in this implementation — never JSON.stringify/parse yourself.
+// Helpers NEVER throw: a miss returns `fallback`, a failed write returns `false` (failures are SILENT).
+// 
+// Use async/await for all storage operations.
+//
+// AUTH TOKENS: use ONE namespace (secure*) + ONE shared key constant, and read/write it the SAME
+// way on both sides — the login/AuthContext (write) and the API client/interceptor (read). A
+// mismatched method or key silently returns the fallback, surfacing as a logged-out state or 401/403
+// with no error in the logs.
+//
+// KEY NAMES: expo-secure-store only accepts [A-Za-z0-9._-]. A key like "auth:token" or "user/session"
+// makes every secureSet throw on a phone; the helper swallows it, so the token is never saved and
+// login/sign-up silently loop. The web preview does not catch this (no Keychain there).
+// Use plain names: "auth_token", "refresh_token".
+
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as SecureStore from "expo-secure-store";
+
+import { AssertNoExtras, StorageBase, StorageItemValue } from "./storage-base";
+
+export class Storage extends StorageBase {
+  // General KV — backed by AsyncStorage.
+  // `fallback` is required and returned on any miss/parse error — a missing key looks identical to a stored `null`.
+  async getItem<Fallback extends StorageItemValue>(
+    key: string,
+    fallback: Fallback,
+  ): Promise<Fallback | null> {
+    try {
+      const raw = await AsyncStorage.getItem(key);
+      return this.retrieve(raw, fallback);
+    } catch (e) {
+      this.warn("getItem", key, e);
+      return fallback;
+    }
+  }
+
+  async setItem<Value extends StorageItemValue>(
+    key: string,
+    value: Value,
+  ): Promise<boolean> {
+    try {
+      await AsyncStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch (e) {
+      this.warn("setItem", key, e);
+      return false;
+    }
+  }
+
+  async removeItem(key: string): Promise<boolean> {
+    try {
+      await AsyncStorage.removeItem(key);
+      return true;
+    } catch (e) {
+      this.warn("removeItem", key, e);
+      return false;
+    }
+  }
+
+  // Sensitive values — Keychain (iOS) / EncryptedSharedPreferences (Android).
+  // Use these (not getItem) for auth tokens; whatever writes with secureSet must read with secureGet under the same key.
+  // Key must match /^[A-Za-z0-9._-]+$/ — no ":", "/" or spaces — or SecureStore throws and nothing is stored.
+  async secureGet<Fallback extends StorageItemValue>(
+    key: string,
+    fallback: Fallback,
+  ): Promise<Fallback | null> {
+    try {
+      const raw = await SecureStore.getItemAsync(key);
+      return this.retrieve(raw, fallback);
+    } catch (e) {
+      this.warn("secureGet", key, e);
+      return fallback;
+    }
+  }
+
+  async secureSet<Value extends StorageItemValue>(
+    key: string,
+    value: Value,
+  ): Promise<boolean> {
+    try {
+      await SecureStore.setItemAsync(key, JSON.stringify(value));
+      return true;
+    } catch (e) {
+      this.warn("secureSet", key, e);
+      return false;
+    }
+  }
+
+  async secureRemove(key: string): Promise<boolean> {
+    try {
+      await SecureStore.deleteItemAsync(key);
+      return true;
+    } catch (e) {
+      this.warn("secureRemove", key, e);
+      return false;
+    }
+  }
+}
+
+// The shared singleton — import THIS (`import { storage } from "@/src/utils/storage"`). Do not `new Storage()`.
+export const storage = new Storage();
+
+// Compile-time guard: any new method must be declared in storage-base.ts first.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- intentional compile-time-only assertion
+type _NoExtras = AssertNoExtras<Exclude<keyof Storage, keyof StorageBase>>;```
+
+## frontend/src/utils/storage/index.web.ts
+```
+// Web storage (Metro picks index.ts on native).
+// Helpers never throw: reads return `fallback`, writes return `false`.
+// Values supported: string | number | boolean | null (JSON-serialized on disk).
+// Usage: import { storage } from "@/src/utils/storage"; await storage.getItem(key, fallback);
+// No Keychain on web — secure* helpers reuse AsyncStorage (no expo-secure-store).
+// Because of that, a key SecureStore rejects on native (":" "/" spaces) works here, so the web preview
+// never shows the bug. Keep secure keys to [A-Za-z0-9._-] ("auth_token"), same as index.ts.
+
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+import { AssertNoExtras, StorageBase, StorageItemValue } from "./storage-base";
+
+export class Storage extends StorageBase {
+  // General KV — backed by AsyncStorage (its built-in web shim uses IndexedDB).
+  async getItem<Fallback extends StorageItemValue>(
+    key: string,
+    fallback: Fallback,
+  ): Promise<Fallback | null> {
+    try {
+      const raw = await AsyncStorage.getItem(key);
+      return this.retrieve(raw, fallback);
+    } catch (e) {
+      this.warn("getItem", key, e);
+      return fallback;
+    }
+  }
+
+  async setItem<Value extends StorageItemValue>(
+    key: string,
+    value: Value,
+  ): Promise<boolean> {
+    try {
+      await AsyncStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch (e) {
+      this.warn("setItem", key, e);
+      return false;
+    }
+  }
+
+  async removeItem(key: string): Promise<boolean> {
+    try {
+      await AsyncStorage.removeItem(key);
+      return true;
+    } catch (e) {
+      this.warn("removeItem", key, e);
+      return false;
+    }
+  }
+
+  // Browsers have no Keychain — secure* helpers fall through to AsyncStorage.
+  async secureGet<Fallback extends StorageItemValue>(
+    key: string,
+    fallback: Fallback,
+  ): Promise<Fallback | null> {
+    return this.getItem(key, fallback);
+  }
+
+  async secureSet<Value extends StorageItemValue>(
+    key: string,
+    value: Value,
+  ): Promise<boolean> {
+    return this.setItem(key, value);
+  }
+
+  async secureRemove(key: string): Promise<boolean> {
+    return this.removeItem(key);
+  }
+}
+
+export const storage = new Storage();
+
+// Compile-time guard: any new method must be declared in storage-base.ts first.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- intentional compile-time-only assertion
+type _NoExtras = AssertNoExtras<Exclude<keyof Storage, keyof StorageBase>>;
+```
+
+## frontend/src/utils/storage/storage-base.ts
+```
+// Abstract base for the storage wrapper — shared types + helpers.
+// Concrete implementations live in index.ts (native) and index.web.ts (web).
+
+export type StorageItemKey = string;
+export type StorageItemValue = string | number | boolean | null;
+
+// Helper for subclasses to enforce that they don't declare methods beyond
+// StorageBase. Use as: type _ = AssertNoExtras<Exclude<keyof Storage, keyof StorageBase>>;
+export type AssertNoExtras<T extends never> = T;
+
+export abstract class StorageBase {
+  protected warn(op: string, key: StorageItemKey, e: unknown) {
+    console.warn(`[storage] ${op}(${key}) failed`, e);
+  }
+
+  // raw is whatever AsyncStorage / SecureStore returned: a JSON-encoded string
+  // (because setItem always JSON.stringifies) or null if the key was missing.
+  // We always JSON.parse so values round-trip correctly across types.
+  protected retrieve<Fallback extends StorageItemValue>(
+    raw: string | null,
+    fallback: Fallback,
+  ): Fallback | null {
+    if (raw === null) return fallback;
+    try {
+      return JSON.parse(raw) as Fallback;
+    } catch (e) {
+      this.warn("retrieve", "parse error", e);
+      return fallback;
+    }
+  }
+
+  abstract getItem<Fallback extends StorageItemValue>(
+    key: string,
+    fallback: Fallback,
+  ): Promise<Fallback | null>;
+  abstract setItem<Value extends StorageItemValue>(
+    key: string,
+    value: Value,
+  ): Promise<boolean>;
+  abstract removeItem(key: string): Promise<boolean>;
+  abstract secureGet<Fallback extends StorageItemValue>(
+    key: string,
+    fallback: Fallback,
+  ): Promise<Fallback | null>;
+  abstract secureSet<Value extends StorageItemValue>(
+    key: string,
+    value: Value,
+  ): Promise<boolean>;
+  abstract secureRemove(key: string): Promise<boolean>;
+}
+```
+
+## frontend/src/utils/upload.ts
+```
+// Multipart upload that works in BOTH runtimes. Use this for every file upload; never
+// build the FormData part yourself.
+//
+//   import { uploadForm } from "@/src/utils/upload";
+//   const res = await uploadForm(`${BACKEND_URL}/api/photos`, {
+//     fields: { caption },
+//     files: { image: { uri: asset.uri, name: "photo.jpg", mimeType: asset.mimeType } },
+//   });
+//
+// Why: on a phone the global fetch is `expo/fetch` (SDK 54+), which rejects the old RN
+// `{ uri, name, type }` part with "Unsupported FormDataPart implementation". The web
+// preview accepts that shape, so the bug only shows on a device. Never set Content-Type:
+// the runtime adds the multipart boundary. No extra dependency: `expo/fetch` reads
+// `file://` on iOS and Android itself (React Native's own fetch cannot on Android).
+
+import { Platform } from "react-native";
+import { fetch as expoFetch } from "expo/fetch";
+
+export type LocalFile = {
+  uri: string; // asset.uri from expo-image-picker / expo-document-picker / expo-audio
+  name?: string; // "photo.jpg"; last path segment of uri when omitted
+  mimeType?: string; // asset.mimeType, e.g. "image/jpeg"
+};
+
+export type UploadOptions = {
+  files: Record<string, LocalFile>; // form field name -> file
+  fields?: Record<string, string>;
+  method?: "POST" | "PUT";
+  headers?: Record<string, string>; // auth only; never Content-Type
+  signal?: AbortSignal;
+};
+
+export function fileNameFor(file: LocalFile): string {
+  return file.name || file.uri.split("?")[0].split("/").pop() || "file";
+}
+
+// Turn a local file into a part that the current runtime's fetch can serialise.
+export async function toFormDataPart(file: LocalFile): Promise<Blob> {
+  if (Platform.OS === "web") {
+    // blob:/data: URL from the browser picker; the browser fetch reads it fine.
+    const blob = await (await fetch(file.uri)).blob();
+    const type = file.mimeType || blob.type;
+    return type && type !== blob.type ? new Blob([blob], { type }) : blob;
+  }
+  // Native: read the local file through expo/fetch (never the RN fetch) and append the Blob.
+  const blob = await (await expoFetch(file.uri)).blob();
+  return file.mimeType && file.mimeType !== blob.type ? new Blob([blob], { type: file.mimeType }) : blob;
+}
+
+export async function uploadForm(url: string, opts: UploadOptions): Promise<Response> {
+  const form = new FormData();
+  for (const [k, v] of Object.entries(opts.fields ?? {})) form.append(k, v);
+  for (const [field, file] of Object.entries(opts.files)) {
+    form.append(field, await toFormDataPart(file), fileNameFor(file));
+  }
+  const init = {
+    method: opts.method ?? "POST",
+    body: form,
+    headers: opts.headers, // the runtime adds the multipart boundary
+    signal: opts.signal,
+  };
+  // Branch the call, not the function reference: the two fetches have different RequestInit types.
+  return Platform.OS === "web" ? fetch(url, init) : expoFetch(url, init);
+}
+```
